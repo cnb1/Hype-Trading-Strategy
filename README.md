@@ -49,6 +49,8 @@ python trading_bots/run_hype_paper_bots.py
 
 This starts five independent paper-trading workers and a local dashboard at `http://127.0.0.1:8765`. The bots share public market data but maintain separate portfolios and strategy parameters.
 
+Each bot saves its paper portfolio in its own JSON file under `trading_bots/state/`. On restart, it restores its cash, open position details, counters, and risk metrics before processing market data. The files are local runtime state and are excluded from Git. If a state file is missing, that bot starts with its configured starting cash and waits for its usual entry signal. These files track simulated positions only; the bots do not inspect or restore live exchange positions.
+
 ## Layout
 
 ```text

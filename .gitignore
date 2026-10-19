@@ -3,4 +3,6 @@ __pycache__/
 .DS_Store
 .venv/
 .env
+trading_bots/state/*.json
+trading_bots/state/*.tmp
 strategy_optimizer/output/*.html

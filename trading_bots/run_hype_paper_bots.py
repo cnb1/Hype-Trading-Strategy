@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -49,6 +50,8 @@ REDUCED_TARGET_MARGIN_THRESHOLD_PCT = 12.0
 REDUCED_TARGET_MULTIPLIER = 0.5
 MAX_ADDITIONAL_BUYS = 15
 TOTAL_STARTING_CASH = 100_000.0
+STATE_DIR = Path(__file__).resolve().parent / "state"
+STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,68 @@ class PaperBot(threading.Thread):
         self.last_action_at: float | None = None
         self.last_error: str | None = None
         self.last_market: MarketSnapshot | None = None
+        self.state_path = STATE_DIR / f"{self._state_slug(definition.name)}.json"
+        self._load_state()
+
+    @staticmethod
+    def _state_slug(name: str) -> str:
+        return "".join(character.lower() if character.isalnum() else "-" for character in name).strip("-")
+
+    def _load_state(self) -> None:
+        """Restore this paper bot's portfolio and counters after a restart."""
+        if not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if state.get("version") != STATE_VERSION or state.get("bot") != self.definition.name:
+                raise ValueError("state version or bot identity does not match")
+            values = state["portfolio"]
+            self.cash = float(values["cash"])
+            self.cycle_start_equity = float(values["cycle_start_equity"])
+            position = values["position"]
+            self.position = Position(**{key: float(position[key]) if key != "buy_count" else int(position[key])
+                                        for key in ("margin_used", "notional", "quantity", "average_entry",
+                                                    "first_entry", "last_buy_price", "buy_count")})
+            for name in ("buys", "closed_cycles", "wins", "liquidations", "partial_reductions",
+                         "reduced_target_exits"):
+                setattr(self, name, int(values.get(name, 0)))
+            self.margin_trimmed = float(values.get("margin_trimmed", 0.0))
+            self.peak_equity = float(values.get("peak_equity", BOT_STARTING_CASH))
+            self.max_drawdown_pct = float(values.get("max_drawdown_pct", 0.0))
+            self.last_action = str(values.get("last_action", "Restored saved bot state."))
+            self.last_action_at = values.get("last_action_at")
+            self.last_error = None
+            self._record_action("Restored saved paper portfolio; resuming strategy.")
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Cannot safely restore {self.definition.name} from {self.state_path}: {error}") from error
+
+    def _save_state(self) -> None:
+        """Atomically persist the complete simulated portfolio for this bot."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        position = self.position
+        state = {
+            "version": STATE_VERSION,
+            "bot": self.definition.name,
+            "saved_at": time.time(),
+            "portfolio": {
+                "cash": self.cash,
+                "cycle_start_equity": self.cycle_start_equity,
+                "position": {"margin_used": position.margin_used, "notional": position.notional,
+                             "quantity": position.quantity, "average_entry": position.average_entry,
+                             "first_entry": position.first_entry, "last_buy_price": position.last_buy_price,
+                             "buy_count": position.buy_count,
+                             "liquidation_price": liquidation_price(position, self.maintenance_rate)
+                             if position.is_open else None},
+                "buys": self.buys, "closed_cycles": self.closed_cycles, "wins": self.wins,
+                "liquidations": self.liquidations, "partial_reductions": self.partial_reductions,
+                "margin_trimmed": self.margin_trimmed, "reduced_target_exits": self.reduced_target_exits,
+                "peak_equity": self.peak_equity, "max_drawdown_pct": self.max_drawdown_pct,
+                "last_action": self.last_action, "last_action_at": self.last_action_at,
+            },
+        }
+        temporary_path = self.state_path.with_suffix(".json.tmp")
+        temporary_path.write_text(json.dumps(state, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        os.replace(temporary_path, self.state_path)
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -178,6 +243,7 @@ class PaperBot(threading.Thread):
                     self.last_error = market.error
                     if market.price is not None and market.rolling_high is not None:
                         self._process_price(market.price, market.rolling_high)
+                    self._save_state()
             except Exception as error:  # Keep the remaining bots and dashboard alive.
                 with self._lock:
                     self.last_error = f"{type(error).__name__}: {error}"
