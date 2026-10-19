@@ -54,6 +54,7 @@ MAX_ADDITIONAL_BUYS = 15
 TOTAL_STARTING_CASH = 100_000.0
 STATE_DIR = Path(__file__).resolve().parent / "state"
 STATE_VERSION = 1
+MAX_TRADE_HISTORY = 50
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,7 @@ class PaperBot(threading.Thread):
         self.last_error: str | None = None
         self.last_market: MarketSnapshot | None = None
         self.trading_enabled = True
+        self.trade_history: list[dict[str, Any]] = []
         self.state_path = STATE_DIR / f"{self._state_slug(definition.name)}.json"
         self._load_state()
 
@@ -203,6 +205,16 @@ class PaperBot(threading.Thread):
             self.peak_equity = float(values.get("peak_equity", BOT_STARTING_CASH))
             self.max_drawdown_pct = float(values.get("max_drawdown_pct", 0.0))
             self.trading_enabled = bool(values.get("trading_enabled", True))
+            history = values.get("trade_history", [])
+            if not isinstance(history, list):
+                raise ValueError("trade history must be a list")
+            self.trade_history = history[-MAX_TRADE_HISTORY:]
+            if not self.trade_history and self.position.is_open:
+                self._record_trade(
+                    "position_imported", source="state_import", reason="open_position_before_history_tracking",
+                    price=self.position.average_entry, margin=self.position.margin_used,
+                    leveraged_value=self.position.notional, quantity=self.position.quantity,
+                )
             self.last_action = str(values.get("last_action", "Restored saved bot state."))
             self.last_action_at = values.get("last_action_at")
             self.last_error = None
@@ -232,6 +244,7 @@ class PaperBot(threading.Thread):
                 "margin_trimmed": self.margin_trimmed, "reduced_target_exits": self.reduced_target_exits,
                 "peak_equity": self.peak_equity, "max_drawdown_pct": self.max_drawdown_pct,
                 "trading_enabled": self.trading_enabled,
+                "trade_history": self.trade_history[-MAX_TRADE_HISTORY:],
                 "last_action": self.last_action, "last_action_at": self.last_action_at,
             },
         }
@@ -258,11 +271,56 @@ class PaperBot(threading.Thread):
         self.last_action = message
         self.last_action_at = time.time()
 
-    def _buy(self, margin_amount: float, fill_price: float, action: str) -> None:
+    def _record_trade(
+        self,
+        event: str,
+        *,
+        source: str,
+        reason: str,
+        price: float,
+        margin: float,
+        leveraged_value: float,
+        quantity: float,
+        realized_pnl: float | None = None,
+        position_closed: bool = False,
+    ) -> None:
+        self.trade_history.append({
+            "timestamp": time.time(),
+            "event": event,
+            "source": source,
+            "reason": reason,
+            "price": price,
+            "margin": margin,
+            "leverage": LEVERAGE,
+            "leveraged_value": leveraged_value,
+            "quantity": quantity,
+            "realized_pnl": realized_pnl,
+            "position_closed": position_closed,
+            "profitable_close": realized_pnl > 0 if position_closed and realized_pnl is not None else None,
+            "position_quantity_after": self.position.quantity,
+            "position_leveraged_value_after": self.position.notional,
+            "margin_used_after": self.position.margin_used,
+            "average_entry_after": self.position.average_entry if self.position.is_open else None,
+            "liquidation_price_after": liquidation_price(self.position, self.maintenance_rate)
+            if self.position.is_open else None,
+        })
+        del self.trade_history[:-MAX_TRADE_HISTORY]
+
+    def _buy(self, margin_amount: float, fill_price: float, action: str, source: str = "strategy") -> None:
+        was_open = self.position.is_open
         self.cash -= margin_amount
         self.position.add_buy(margin_amount, fill_price, LEVERAGE)
         self.buys += 1
         self._record_action(action)
+        self._record_trade(
+            "average_down" if was_open and source == "strategy" else "buy",
+            source=source,
+            reason="average_down" if was_open and source == "strategy" else ("manual_buy" if source == "manual" else "entry"),
+            price=fill_price,
+            margin=margin_amount,
+            leveraged_value=margin_amount * LEVERAGE,
+            quantity=margin_amount * LEVERAGE / fill_price,
+        )
 
     def control(self, action: str, amount: float | None = None) -> None:
         """Apply a manual paper-trading action or pause/resume strategy automation."""
@@ -281,11 +339,18 @@ class PaperBot(threading.Thread):
                     raise ValueError("Market price is not available yet.")
                 price = market.price
                 if action == "buy":
-                    if amount > self.cash:
-                        raise ValueError(f"Insufficient available cash (${self.cash:,.2f}).")
+                    margin_amount = amount / LEVERAGE
+                    if margin_amount > self.cash:
+                        raise ValueError(
+                            f"This buy needs ${margin_amount:,.2f} margin, but only ${self.cash:,.2f} is available."
+                        )
                     if not self.position.is_open:
                         self.cycle_start_equity = self.cash
-                    self._buy(amount, price, f"Manual paper buy with ${amount:,.2f} margin at ${price:,.4f}.")
+                    self._buy(
+                        margin_amount, price,
+                        f"Manual paper buy of ${amount:,.2f} position value using ${margin_amount:,.2f} margin at ${price:,.4f}.",
+                        source="manual",
+                    )
                 elif action == "add_margin":
                     if not self.position.is_open:
                         raise ValueError("Open a position before adding margin.")
@@ -294,13 +359,28 @@ class PaperBot(threading.Thread):
                     self.cash -= amount
                     self.position.margin_used += amount
                     self._record_action(f"Added ${amount:,.2f} paper margin at ${price:,.4f}; position size unchanged.")
+                    self._record_trade(
+                        "margin_added", source="manual", reason="collateral_added", price=price,
+                        margin=amount, leveraged_value=0.0, quantity=0.0,
+                    )
                 else:
                     if not self.position.is_open:
                         raise ValueError("There is no open position to sell.")
-                    if amount - self.position.quantity > 0.000001:
-                        raise ValueError(f"Sell quantity exceeds the open position ({self.position.quantity:.6f} HYPE).")
-                    quantity_sold = min(amount, self.position.quantity)
+                    current_position_value = self.position.quantity * price
+                    if amount - current_position_value > 0.01:
+                        raise ValueError(
+                            f"Sell value exceeds the open position (${current_position_value:,.2f} at the current price)."
+                        )
+                    quantity_sold = self.position.quantity if current_position_value - amount <= 0.01 else amount / price
+                    was_fully_closed = quantity_sold >= self.position.quantity
+                    margin_released = self.position.margin_used * quantity_sold / self.position.quantity
                     self.cash, realized_pnl = close_quantity(self.cash, self.position, quantity_sold, price)
+                    self._record_trade(
+                        "position_closed" if was_fully_closed else "sell",
+                        source="manual", reason="manual_close" if was_fully_closed else "manual_partial_sale",
+                        price=price, margin=margin_released, leveraged_value=quantity_sold * price,
+                        quantity=quantity_sold, realized_pnl=realized_pnl, position_closed=was_fully_closed,
+                    )
                     if self.position.is_open:
                         self.partial_reductions += 1
                         self._record_action(
@@ -329,6 +409,7 @@ class PaperBot(threading.Thread):
 
     def _trim_to_margin_cap(self, fill_price: float) -> None:
         quantity_before_trim = self.position.quantity
+        average_entry_before_trim = self.position.average_entry
         self.cash, was_trimmed, trimmed_amount = enforce_margin_cap(
             self.cash,
             self.position,
@@ -340,13 +421,25 @@ class PaperBot(threading.Thread):
             trimmed_quantity = quantity_before_trim - self.position.quantity
             self.partial_reductions += 1
             self.margin_trimmed += trimmed_amount
+            self._record_trade(
+                "sell", source="strategy", reason="margin_cap_reduction", price=fill_price,
+                margin=trimmed_amount, leveraged_value=trimmed_quantity * fill_price,
+                quantity=trimmed_quantity, realized_pnl=trimmed_quantity * (fill_price - average_entry_before_trim),
+            )
             self._record_action(
                 f"Trimmed {trimmed_quantity:.4f} HYPE to keep cycle margin at {MAX_CYCLE_MARGIN_PCT:g}%."
             )
 
     def _liquidate(self, liquidation_price_value: float) -> None:
         lost_margin = self.position.margin_used
+        quantity = self.position.quantity
+        notional = self.position.notional
         self.position.__init__()
+        self._record_trade(
+            "liquidation", source="risk_monitor", reason="liquidation_price_reached",
+            price=liquidation_price_value, margin=lost_margin, leveraged_value=notional,
+            quantity=quantity, realized_pnl=-lost_margin, position_closed=True,
+        )
         self.closed_cycles += 1
         self.liquidations += 1
         self._record_action(f"Paper liquidation at ${liquidation_price_value:,.4f}; margin lost: ${lost_margin:,.2f}.")
@@ -396,7 +489,14 @@ class PaperBot(threading.Thread):
             target_price, used_reduced_target, margin_pct = self._take_profit_target(price)
             if price >= target_price:
                 quantity_closed = self.position.quantity
+                closed_margin = self.position.margin_used
+                realized_pnl = quantity_closed * (price - self.position.average_entry)
                 self.cash, was_win = close_position(self.cash, self.position, price)
+                self._record_trade(
+                    "position_closed", source="strategy", reason="take_profit",
+                    price=price, margin=closed_margin, leveraged_value=quantity_closed * price,
+                    quantity=quantity_closed, realized_pnl=realized_pnl, position_closed=True,
+                )
                 self.closed_cycles += 1
                 self.wins += int(was_win)
                 self.reduced_target_exits += int(used_reduced_target)
@@ -452,6 +552,7 @@ class PaperBot(threading.Thread):
                 "notional": self.position.notional,
                 "quantity": self.position.quantity,
                 "buy_count": self.position.buy_count,
+                "trade_history": list(reversed(self.trade_history[-MAX_TRADE_HISTORY:])),
                 "average_entry": self.position.average_entry if self.position.is_open else None,
                 "target_price": target_price,
                 "liquidation_price": liquidation_price_value,
@@ -509,38 +610,56 @@ DASHBOARD_HTML = """<!doctype html>
     .market { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); border:1px solid var(--line); background:var(--panel); }
     .market-item { padding:14px 16px; border-right:1px solid var(--line); min-height:70px; }
     .market-item:last-child { border-right:0; }
-    .label { color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-size:10px; font-weight:700; }
+    .label { color:var(--muted); text-transform:uppercase; letter-spacing:.04em; font-size:clamp(8px, .65vw + 3px, 10px); font-weight:700; }
     .value { margin-top:5px; font-size:18px; font-variant-numeric:tabular-nums; }
-    .grid { display:grid; grid-template-columns:repeat(5, minmax(250px, 1fr)); gap:12px; margin-top:16px; }
+    .grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:clamp(4px, .8vw, 12px); margin-top:16px; align-items:start; }
     .bot { border:1px solid var(--line); background:var(--panel); min-width:0; }
     .bot-header { display:flex; justify-content:space-between; align-items:center; padding:14px 14px 12px; border-bottom:1px solid var(--line); }
-    .bot-name { font-size:16px; font-weight:700; }
+    .bot-name { font-size:clamp(9px, 1vw + 4px, 16px); font-weight:700; }
     .badge { border:1px solid var(--line); color:var(--muted); padding:4px 7px; font-size:10px; white-space:nowrap; }
     .badge.open { color:var(--up); border-color:rgba(22,199,132,.35); background:rgba(22,199,132,.08); }
     .badge.paused { color:var(--amber); border-color:rgba(240,185,11,.35); background:rgba(240,185,11,.08); }
     .params { display:grid; grid-template-columns:1fr 1fr; gap:0; padding:10px 14px; border-bottom:1px solid var(--line); }
-    .param { padding:5px 0; font-size:11px; color:var(--muted); }
+    .param { padding:5px 0; font-size:clamp(8px, .7vw + 3px, 11px); color:var(--muted); overflow-wrap:anywhere; }
     .param b { display:block; color:#cdd2dc; font-weight:600; margin-top:2px; }
     .metrics { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }
     .metric { background:var(--panel); padding:12px 14px; min-height:64px; }
-    .metric .value { font-size:16px; }
+    .metric .value { font-size:clamp(10px, 1vw + 4px, 16px); overflow-wrap:anywhere; }
     .positive { color:var(--up); } .negative { color:var(--down); } .neutral { color:var(--text); }
     .levels { margin:0; padding:12px 14px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
-    .level { display:flex; justify-content:space-between; gap:8px; padding:4px 0; color:var(--muted); font-size:11px; }
+    .level { display:flex; justify-content:space-between; gap:4px; padding:4px 0; color:var(--muted); font-size:clamp(8px, .7vw + 3px, 11px); }
     .level span:last-child { color:#dfe3ea; font-variant-numeric:tabular-nums; text-align:right; }
     .action { padding:12px 14px 14px; min-height:77px; color:#c8ced8; font-size:12px; line-height:1.45; }
     .action-time { color:var(--muted); font-size:10px; margin-top:8px; }
     .controls { padding:12px 14px; border-top:1px solid var(--line); }
     .control-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:6px; margin-top:7px; }
     .controls input { min-width:0; width:100%; border:1px solid var(--line); background:#10131a; color:var(--text); padding:8px; font-size:12px; }
+    .controls select { min-width:0; width:100%; border:1px solid var(--line); background:#10131a; color:var(--text); padding:8px; font-size:12px; }
+    .control-row.manual-control-row { grid-template-columns:minmax(0, 1fr) minmax(0, 1.2fr) auto; }
+    .control-unit { color:var(--muted); text-align:right; font-size:10px; margin-top:4px; }
+    .control-help { color:var(--muted); font-size:10px; line-height:1.4; margin-top:6px; }
     .controls button { border:1px solid #3b4659; background:#222a38; color:var(--text); padding:8px 10px; font-size:11px; cursor:pointer; }
     .controls button:hover:not(:disabled) { background:#303b4e; }
     .controls button:disabled { opacity:.45; cursor:not-allowed; }
     .control-heading { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-weight:700; }
     .control-message { min-height:15px; margin-top:8px; color:var(--amber); font-size:10px; line-height:1.4; }
+    .history { padding:0 14px 12px; }
+    .history summary { color:var(--blue); font-size:11px; cursor:pointer; }
+    .history-scroll { max-height:360px; overflow-x:scroll; overflow-y:scroll; overscroll-behavior:contain; scrollbar-gutter:stable; margin-top:9px; }
+    .history-scroll::-webkit-scrollbar { width:10px; height:10px; }
+    .history-scroll::-webkit-scrollbar-track { background:#10131a; }
+    .history-scroll::-webkit-scrollbar-thumb { background:#41495a; border:2px solid #10131a; }
+    .history table { width:100%; min-width:820px; border-collapse:collapse; font-size:10px; }
+    .history th, .history td { padding:6px 7px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+    .history th { color:var(--muted); font-weight:600; }
+    .history th:nth-child(2), .history td:nth-child(2) { text-align:left; }
+    .history td { color:#dfe3ea; font-variant-numeric:tabular-nums; }
+    .history-reason { color:var(--muted); }
+    .history-empty { color:var(--muted); padding:8px; font-size:11px; }
     .error { color:var(--down); border-top:1px solid var(--line); padding:10px 14px; font-size:11px; line-height:1.4; }
-    @media (max-width:1300px) { .market { grid-template-columns:repeat(3, minmax(0, 1fr)); } .market-item:nth-child(3n) { border-right:0; } .market-item:nth-child(-n+3) { border-bottom:1px solid var(--line); } .grid { grid-template-columns:repeat(3, minmax(250px, 1fr)); } }
-    @media (max-width:850px) { header { align-items:flex-start; flex-direction:column; } .updated { text-align:left; } .market { grid-template-columns:1fr 1fr; } .market-item:nth-child(2n) { border-right:0; } .market-item:nth-child(-n+4) { border-bottom:1px solid var(--line); } .grid { grid-template-columns:1fr; } }
+    @media (max-width:1300px) { .market { grid-template-columns:repeat(3, minmax(0, 1fr)); } .market-item:nth-child(3n) { border-right:0; } .market-item:nth-child(-n+3) { border-bottom:1px solid var(--line); } }
+    @media (max-width:850px) { header { align-items:flex-start; flex-direction:column; } .updated { text-align:left; } .market { grid-template-columns:1fr 1fr; } .market-item:nth-child(2n) { border-right:0; } .market-item:nth-child(-n+4) { border-bottom:1px solid var(--line); } .control-row.manual-control-row { grid-template-columns:1fr; } }
+    @media (max-width:420px) { main { padding:10px 8px 24px; } .grid { gap:4px; } .bot-header, .params, .metric, .levels, .action, .controls { padding-left:6px; padding-right:6px; } .history { padding-left:6px; padding-right:6px; } }
   </style>
 </head>
 <body>
@@ -561,6 +680,10 @@ DASHBOARD_HTML = """<!doctype html>
     const color = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
     const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const level = (label, value) => `<div class="level"><span>${label}</span><span>${value}</span></div>`;
+    const eventLabel = trade => {
+      if (trade.event === 'position_closed') return trade.profitable_close ? 'Position closed · profit' : 'Position closed';
+      return ({buy:'Buy', average_down:'Average down', sell:'Sell', liquidation:'Liquidation', margin_added:'Margin added', position_imported:'Imported position'}[trade.event] || trade.event);
+    };
     const controlMessages = {};
     const pendingControls = {};
     async function controlBot(event, botId, action, inputId) {
@@ -585,9 +708,33 @@ DASHBOARD_HTML = """<!doctype html>
         refresh();
       }
     }
+    function updateManualControl(botId) {
+      const action = document.getElementById(`${botId}-action`)?.value || 'buy';
+      const amount = document.getElementById(`${botId}-amount`);
+      const placeholder = {
+        buy:'Buy USD position value',
+        sell:'Sell USD position value',
+        add_margin:'Add USD collateral',
+      }[action] || 'Amount in USD';
+      if (amount) {
+        amount.placeholder = placeholder;
+        amount.setAttribute('aria-label', placeholder);
+        amount.step = '0.01';
+        amount.min = '0.01';
+      }
+      const unit = document.getElementById(`${botId}-amount-unit`);
+      if (unit) unit.textContent = 'All amounts in USD';
+    }
     function render(data) {
       const focusedId = document.activeElement?.matches('[data-control-input]') ? document.activeElement.id : null;
+      let selectionStart = null;
+      let selectionEnd = null;
+      if (focusedId && document.activeElement instanceof HTMLInputElement) {
+        selectionStart = document.activeElement.selectionStart;
+        selectionEnd = document.activeElement.selectionEnd;
+      }
       const savedInputValues = Object.fromEntries([...document.querySelectorAll('[data-control-input]')].map(input => [input.id, input.value]));
+      const openHistoryIds = new Set([...document.querySelectorAll('details[data-history-id][open]')].map(details => details.dataset.historyId));
       const first = data.bots[0] || {};
       document.getElementById('updated').innerHTML = `Last public-market update: ${time(first.market_updated_at)}<br>Dashboard refreshes every 2 seconds`;
       document.getElementById('market').innerHTML = [
@@ -600,9 +747,20 @@ DASHBOARD_HTML = """<!doctype html>
         const p = bot.parameters;
         const isOpen = bot.position_open;
         const paused = !bot.trading_enabled;
-        const buyId = `${bot.bot_id}-buy-amount`;
-        const sellId = `${bot.bot_id}-sell-amount`;
-        const marginId = `${bot.bot_id}-margin-amount`;
+        const actionId = `${bot.bot_id}-action`;
+        const amountId = `${bot.bot_id}-amount`;
+        const history = bot.trade_history || [];
+        const historyId = `history-${bot.bot_id}`;
+        const historyRows = history.map(trade => `<tr>
+          <td>${new Date(trade.timestamp * 1000).toLocaleString()}</td>
+          <td>${eventLabel(trade)}<br><small>${escapeHtml(trade.source)} · <span class="history-reason">${escapeHtml((trade.reason || '').replaceAll('_', ' '))}</span></small></td>
+          <td>${price(trade.price)}</td>
+          <td>${money(trade.margin)}</td>
+          <td>${money(trade.leveraged_value)}</td>
+          <td>${Number(trade.quantity).toFixed(6)}</td>
+          <td class="${color(trade.realized_pnl || 0)}">${trade.realized_pnl == null ? '—' : signed(trade.realized_pnl)}</td>
+          <td>${price(trade.liquidation_price_after)}</td>
+        </tr>`).join('');
         return `<article class="bot">
           <div class="bot-header"><div class="bot-name">${bot.name}</div><div class="badge ${paused ? 'paused' : (isOpen ? 'open' : '')}">${bot.status}</div></div>
           <div class="params">
@@ -629,11 +787,26 @@ DASHBOARD_HTML = """<!doctype html>
           <div class="controls">
             <div class="control-heading">Manual paper controls</div>
             <div class="control-row"><button onclick="controlBot(event, '${bot.bot_id}', '${paused ? 'resume' : 'pause'}')">${paused ? 'Resume automation' : 'Pause automation'}</button><span></span></div>
-            <div class="control-row"><input id="${buyId}" data-control-input type="number" min="0.01" step="0.01" placeholder="Margin in USD" aria-label="${bot.name} buy margin in USD"><button onclick="controlBot(event, '${bot.bot_id}', 'buy', '${buyId}')">Buy</button></div>
-            <div class="control-row"><input id="${sellId}" data-control-input type="number" min="0.000001" step="any" placeholder="HYPE quantity" aria-label="${bot.name} sell quantity" ${isOpen ? '' : 'disabled'}><button onclick="controlBot(event, '${bot.bot_id}', 'sell', '${sellId}')" ${isOpen ? '' : 'disabled'}>Sell</button></div>
-            <div class="control-row"><input id="${marginId}" data-control-input type="number" min="0.01" step="0.01" placeholder="Margin in USD" aria-label="${bot.name} added margin" ${isOpen ? '' : 'disabled'}><button onclick="controlBot(event, '${bot.bot_id}', 'add_margin', '${marginId}')" ${isOpen ? '' : 'disabled'}>Add margin</button></div>
+            <div class="control-row manual-control-row">
+              <select id="${actionId}" data-control-input onchange="updateManualControl('${bot.bot_id}')" aria-label="${bot.name} manual action">
+                <option value="buy">Buy</option>
+                <option value="sell" ${isOpen ? '' : 'disabled'}>Sell</option>
+                <option value="add_margin" ${isOpen ? '' : 'disabled'}>Add margin</option>
+              </select>
+              <input id="${amountId}" data-control-input type="number" min="0.01" step="0.01" placeholder="Buy USD position value" aria-label="Buy USD position value">
+              <button onclick="controlBot(event, '${bot.bot_id}', document.getElementById('${actionId}').value, '${amountId}')">Submit</button>
+            </div>
+            <div class="control-unit" id="${bot.bot_id}-amount-unit">All amounts in USD</div>
+            <div class="control-help">Buy and sell use USD position value. Buys use 5× leverage; add margin is USD collateral.</div>
             <div class="control-message" id="message-${bot.bot_id}">${escapeHtml(controlMessages[bot.bot_id] || '')}</div>
           </div>
+          <details class="history" data-history-id="${historyId}">
+            <summary>Trade history (${history.length}/50)</summary>
+            <div class="history-scroll"><table>
+              <thead><tr><th>Time</th><th>Event</th><th>Price</th><th>Margin</th><th>Leveraged value</th><th>HYPE</th><th>Realized P&amp;L</th><th>Liquidation after</th></tr></thead>
+              <tbody>${historyRows || '<tr><td colspan="8" class="history-empty">No trades recorded yet.</td></tr>'}</tbody>
+            </table></div>
+          </details>
           ${bot.last_error ? `<div class="error">Market-data issue: ${bot.last_error}</div>` : ''}
         </article>`;
       }).join('');
@@ -641,10 +814,20 @@ DASHBOARD_HTML = """<!doctype html>
         const input = document.getElementById(id);
         if (input) input.value = value;
       }
+      for (const bot of data.bots) updateManualControl(bot.bot_id);
       for (const botId of Object.keys(pendingControls)) {
         if (pendingControls[botId]) document.querySelectorAll(`[onclick*="${botId}"]`).forEach(control => control.disabled = true);
       }
-      if (focusedId) document.getElementById(focusedId)?.focus({preventScroll:true});
+      for (const details of document.querySelectorAll('details[data-history-id]')) {
+        details.open = openHistoryIds.has(details.dataset.historyId);
+      }
+      if (focusedId) {
+        const focusedElement = document.getElementById(focusedId);
+        focusedElement?.focus({preventScroll:true});
+        if (focusedElement instanceof HTMLInputElement && selectionStart != null && selectionEnd != null) {
+          try { focusedElement.setSelectionRange(selectionStart, selectionEnd); } catch (error) {}
+        }
+      }
     }
     async function refresh() {
       try { render(await (await fetch('/api/state', {cache:'no-store'})).json()); }
@@ -689,6 +872,9 @@ def build_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 response = json.dumps({"error": str(error)}).encode("utf-8")
                 self._respond(HTTPStatus.BAD_REQUEST, "application/json; charset=utf-8", response)
+            except OSError as error:
+                response = json.dumps({"error": f"Manual action was applied in memory, but state could not be saved: {error}"}).encode("utf-8")
+                self._respond(HTTPStatus.INTERNAL_SERVER_ERROR, "application/json; charset=utf-8", response)
 
         def log_message(self, format: str, *args: Any) -> None:
             return
