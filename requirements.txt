@@ -1,0 +1,9 @@
+# HYPE agent, candle updater, optimizer, chart viewer, and paper-trading bots.
+google-adk==2.7.1
+google-genai==2.20.0
+litellm==1.105.1
+openai==2.54.0
+pandas==3.0.5
+plotly==7.1.0
+python-dotenv==1.2.3
+requests==2.34.2
