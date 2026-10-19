@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -33,6 +34,7 @@ from optimize_scalping_strategy import (  # noqa: E402
     LEVERAGE,
     Position,
     StrategyParams,
+    close_quantity,
     close_position,
     enforce_margin_cap,
     equity,
@@ -171,6 +173,7 @@ class PaperBot(threading.Thread):
         self.last_action_at: float | None = None
         self.last_error: str | None = None
         self.last_market: MarketSnapshot | None = None
+        self.trading_enabled = True
         self.state_path = STATE_DIR / f"{self._state_slug(definition.name)}.json"
         self._load_state()
 
@@ -199,6 +202,7 @@ class PaperBot(threading.Thread):
             self.margin_trimmed = float(values.get("margin_trimmed", 0.0))
             self.peak_equity = float(values.get("peak_equity", BOT_STARTING_CASH))
             self.max_drawdown_pct = float(values.get("max_drawdown_pct", 0.0))
+            self.trading_enabled = bool(values.get("trading_enabled", True))
             self.last_action = str(values.get("last_action", "Restored saved bot state."))
             self.last_action_at = values.get("last_action_at")
             self.last_error = None
@@ -227,6 +231,7 @@ class PaperBot(threading.Thread):
                 "liquidations": self.liquidations, "partial_reductions": self.partial_reductions,
                 "margin_trimmed": self.margin_trimmed, "reduced_target_exits": self.reduced_target_exits,
                 "peak_equity": self.peak_equity, "max_drawdown_pct": self.max_drawdown_pct,
+                "trading_enabled": self.trading_enabled,
                 "last_action": self.last_action, "last_action_at": self.last_action_at,
             },
         }
@@ -258,6 +263,69 @@ class PaperBot(threading.Thread):
         self.position.add_buy(margin_amount, fill_price, LEVERAGE)
         self.buys += 1
         self._record_action(action)
+
+    def control(self, action: str, amount: float | None = None) -> None:
+        """Apply a manual paper-trading action or pause/resume strategy automation."""
+        with self._lock:
+            if action == "pause":
+                self.trading_enabled = False
+                self._record_action("Automated entries, average-downs, and take-profit exits paused; liquidation monitoring remains active.")
+            elif action == "resume":
+                self.trading_enabled = True
+                self._record_action("Automated strategy resumed.")
+            elif action in {"buy", "sell", "add_margin"}:
+                if amount is None or not math.isfinite(amount) or amount <= 0:
+                    raise ValueError("Enter an amount greater than zero.")
+                market = self.last_market
+                if market is None or market.price is None:
+                    raise ValueError("Market price is not available yet.")
+                price = market.price
+                if action == "buy":
+                    if amount > self.cash:
+                        raise ValueError(f"Insufficient available cash (${self.cash:,.2f}).")
+                    if not self.position.is_open:
+                        self.cycle_start_equity = self.cash
+                    self._buy(amount, price, f"Manual paper buy with ${amount:,.2f} margin at ${price:,.4f}.")
+                elif action == "add_margin":
+                    if not self.position.is_open:
+                        raise ValueError("Open a position before adding margin.")
+                    if amount > self.cash:
+                        raise ValueError(f"Insufficient available cash (${self.cash:,.2f}).")
+                    self.cash -= amount
+                    self.position.margin_used += amount
+                    self._record_action(f"Added ${amount:,.2f} paper margin at ${price:,.4f}; position size unchanged.")
+                else:
+                    if not self.position.is_open:
+                        raise ValueError("There is no open position to sell.")
+                    if amount - self.position.quantity > 0.000001:
+                        raise ValueError(f"Sell quantity exceeds the open position ({self.position.quantity:.6f} HYPE).")
+                    quantity_sold = min(amount, self.position.quantity)
+                    self.cash, realized_pnl = close_quantity(self.cash, self.position, quantity_sold, price)
+                    if self.position.is_open:
+                        self.partial_reductions += 1
+                        self._record_action(
+                            f"Manual paper sale of {quantity_sold:.6f} HYPE at ${price:,.4f}; "
+                            f"realized P&L ${realized_pnl:,.2f}."
+                        )
+                    else:
+                        self.closed_cycles += 1
+                        self.wins += int(realized_pnl > 0)
+                        self._record_action(
+                            f"Manual paper sale closed the position at ${price:,.4f}; "
+                            f"realized P&L ${realized_pnl:,.2f}."
+                        )
+            else:
+                raise ValueError("Unknown bot action.")
+            self._save_state()
+
+    def _update_equity_metrics(self, price: float) -> None:
+        current_equity = equity(self.cash, self.position, price)
+        self.peak_equity = max(self.peak_equity, current_equity)
+        if self.peak_equity > 0:
+            self.max_drawdown_pct = max(
+                self.max_drawdown_pct,
+                (self.peak_equity - current_equity) / self.peak_equity * 100.0,
+            )
 
     def _trim_to_margin_cap(self, fill_price: float) -> None:
         quantity_before_trim = self.position.quantity
@@ -295,7 +363,7 @@ class PaperBot(threading.Thread):
 
     def _process_price(self, price: float, rolling_high: float) -> None:
         params = self.definition.params
-        if not self.position.is_open:
+        if self.trading_enabled and not self.position.is_open:
             initial_trigger = rolling_high * (1.0 - params.initial_drop_pct / 100.0)
             self.cycle_start_equity = self.cash
             first_margin = self.cycle_start_equity * params.first_buy_fraction
@@ -304,7 +372,7 @@ class PaperBot(threading.Thread):
                 self._trim_to_margin_cap(price)
 
         liquidated_this_tick = False
-        while self.position.is_open and self.position.buy_count - 1 < MAX_ADDITIONAL_BUYS:
+        while self.trading_enabled and self.position.is_open and self.position.buy_count - 1 < MAX_ADDITIONAL_BUYS:
             next_buy_price = self.position.last_buy_price * (1.0 - params.recurring_drop_pct / 100.0)
             current_liquidation_price = liquidation_price(self.position, self.maintenance_rate)
             if current_liquidation_price >= next_buy_price and price <= current_liquidation_price:
@@ -324,7 +392,7 @@ class PaperBot(threading.Thread):
                 self._liquidate(current_liquidation_price)
                 liquidated_this_tick = True
 
-        if self.position.is_open and not liquidated_this_tick:
+        if self.trading_enabled and self.position.is_open and not liquidated_this_tick:
             target_price, used_reduced_target, margin_pct = self._take_profit_target(price)
             if price >= target_price:
                 quantity_closed = self.position.quantity
@@ -338,13 +406,7 @@ class PaperBot(threading.Thread):
                     f"({margin_pct:.2f}% margin exposure)."
                 )
 
-        current_equity = equity(self.cash, self.position, price)
-        self.peak_equity = max(self.peak_equity, current_equity)
-        if self.peak_equity > 0:
-            self.max_drawdown_pct = max(
-                self.max_drawdown_pct,
-                (self.peak_equity - current_equity) / self.peak_equity * 100.0,
-            )
+        self._update_equity_metrics(price)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -373,7 +435,11 @@ class PaperBot(threading.Thread):
                     "recurring_buy_pct": self.definition.params.recurring_buy_fraction * 100.0,
                     "take_profit_margin_pct": self.definition.params.take_profit_margin_pct,
                 },
-                "status": "In position" if self.position.is_open else "Waiting for dip",
+                "bot_id": self._state_slug(self.definition.name),
+                "position_open": self.position.is_open,
+                "trading_enabled": self.trading_enabled,
+                "status": ("In position" if self.position.is_open else "Waiting for dip")
+                          if self.trading_enabled else ("Paused · in position" if self.position.is_open else "Paused"),
                 "price": price,
                 "rolling_high": rolling_high,
                 "initial_trigger": initial_trigger,
@@ -383,8 +449,9 @@ class PaperBot(threading.Thread):
                 "starting_cash": BOT_STARTING_CASH,
                 "cash": self.cash,
                 "margin_used": self.position.margin_used,
-                "notional": self.position.margin_used * LEVERAGE,
+                "notional": self.position.notional,
                 "quantity": self.position.quantity,
+                "buy_count": self.position.buy_count,
                 "average_entry": self.position.average_entry if self.position.is_open else None,
                 "target_price": target_price,
                 "liquidation_price": liquidation_price_value,
@@ -450,6 +517,7 @@ DASHBOARD_HTML = """<!doctype html>
     .bot-name { font-size:16px; font-weight:700; }
     .badge { border:1px solid var(--line); color:var(--muted); padding:4px 7px; font-size:10px; white-space:nowrap; }
     .badge.open { color:var(--up); border-color:rgba(22,199,132,.35); background:rgba(22,199,132,.08); }
+    .badge.paused { color:var(--amber); border-color:rgba(240,185,11,.35); background:rgba(240,185,11,.08); }
     .params { display:grid; grid-template-columns:1fr 1fr; gap:0; padding:10px 14px; border-bottom:1px solid var(--line); }
     .param { padding:5px 0; font-size:11px; color:var(--muted); }
     .param b { display:block; color:#cdd2dc; font-weight:600; margin-top:2px; }
@@ -462,6 +530,14 @@ DASHBOARD_HTML = """<!doctype html>
     .level span:last-child { color:#dfe3ea; font-variant-numeric:tabular-nums; text-align:right; }
     .action { padding:12px 14px 14px; min-height:77px; color:#c8ced8; font-size:12px; line-height:1.45; }
     .action-time { color:var(--muted); font-size:10px; margin-top:8px; }
+    .controls { padding:12px 14px; border-top:1px solid var(--line); }
+    .control-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:6px; margin-top:7px; }
+    .controls input { min-width:0; width:100%; border:1px solid var(--line); background:#10131a; color:var(--text); padding:8px; font-size:12px; }
+    .controls button { border:1px solid #3b4659; background:#222a38; color:var(--text); padding:8px 10px; font-size:11px; cursor:pointer; }
+    .controls button:hover:not(:disabled) { background:#303b4e; }
+    .controls button:disabled { opacity:.45; cursor:not-allowed; }
+    .control-heading { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-weight:700; }
+    .control-message { min-height:15px; margin-top:8px; color:var(--amber); font-size:10px; line-height:1.4; }
     .error { color:var(--down); border-top:1px solid var(--line); padding:10px 14px; font-size:11px; line-height:1.4; }
     @media (max-width:1300px) { .market { grid-template-columns:repeat(3, minmax(0, 1fr)); } .market-item:nth-child(3n) { border-right:0; } .market-item:nth-child(-n+3) { border-bottom:1px solid var(--line); } .grid { grid-template-columns:repeat(3, minmax(250px, 1fr)); } }
     @media (max-width:850px) { header { align-items:flex-start; flex-direction:column; } .updated { text-align:left; } .market { grid-template-columns:1fr 1fr; } .market-item:nth-child(2n) { border-right:0; } .market-item:nth-child(-n+4) { border-bottom:1px solid var(--line); } .grid { grid-template-columns:1fr; } }
@@ -469,7 +545,7 @@ DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
   <header>
-    <div><h1>HYPE Paper Bot Monitor</h1><div class="subtitle">Five independent 5x leveraged simulations. No exchange orders are submitted.</div></div>
+    <div><h1>HYPE Paper Bot Monitor</h1><div class="subtitle">Five independent 5x paper simulations. Manual actions use the current public price; pausing disables strategy trades while liquidation monitoring continues. No exchange orders are submitted.</div></div>
     <div class="updated" id="updated">Connecting to market data...</div>
   </header>
   <main>
@@ -483,8 +559,35 @@ DASHBOARD_HTML = """<!doctype html>
     const time = value => value == null ? '—' : new Date(value * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
     const signed = value => (value >= 0 ? '+' : '') + money(value);
     const color = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
+    const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const level = (label, value) => `<div class="level"><span>${label}</span><span>${value}</span></div>`;
+    const controlMessages = {};
+    const pendingControls = {};
+    async function controlBot(event, botId, action, inputId) {
+      if (pendingControls[botId]) return;
+      pendingControls[botId] = true;
+      const message = document.getElementById(`message-${botId}`);
+      const button = event.currentTarget;
+      if (button) button.disabled = true;
+      try {
+        const payload = {bot_id:botId, action};
+        if (inputId) payload.amount = Number(document.getElementById(inputId).value);
+        const response = await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Action failed.');
+        controlMessages[botId] = 'Action saved.';
+        if (inputId) document.getElementById(inputId).value = '';
+      } catch (error) {
+        controlMessages[botId] = error.message;
+      } finally {
+        pendingControls[botId] = false;
+        if (message) message.textContent = controlMessages[botId] || '';
+        refresh();
+      }
+    }
     function render(data) {
+      const focusedId = document.activeElement?.matches('[data-control-input]') ? document.activeElement.id : null;
+      const savedInputValues = Object.fromEntries([...document.querySelectorAll('[data-control-input]')].map(input => [input.id, input.value]));
       const first = data.bots[0] || {};
       document.getElementById('updated').innerHTML = `Last public-market update: ${time(first.market_updated_at)}<br>Dashboard refreshes every 2 seconds`;
       document.getElementById('market').innerHTML = [
@@ -495,9 +598,13 @@ DASHBOARD_HTML = """<!doctype html>
       ].map(([label, value, valueClass]) => `<div class="market-item"><div class="label">${label}</div><div class="value ${valueClass}">${value}</div></div>`).join('');
       document.getElementById('bots').innerHTML = data.bots.map(bot => {
         const p = bot.parameters;
-        const isOpen = bot.status === 'In position';
+        const isOpen = bot.position_open;
+        const paused = !bot.trading_enabled;
+        const buyId = `${bot.bot_id}-buy-amount`;
+        const sellId = `${bot.bot_id}-sell-amount`;
+        const marginId = `${bot.bot_id}-margin-amount`;
         return `<article class="bot">
-          <div class="bot-header"><div class="bot-name">${bot.name}</div><div class="badge ${isOpen ? 'open' : ''}">${bot.status}</div></div>
+          <div class="bot-header"><div class="bot-name">${bot.name}</div><div class="badge ${paused ? 'paused' : (isOpen ? 'open' : '')}">${bot.status}</div></div>
           <div class="params">
             <div class="param">Initial dip<b>${p.initial_drop_pct}%</b></div><div class="param">Recurring dip<b>${p.recurring_drop_pct}%</b></div>
             <div class="param">First / recurring<b>${p.first_buy_pct}% / ${p.recurring_buy_pct}%</b></div><div class="param">Margin target<b>${p.take_profit_margin_pct}%${bot.reduced_target ? ' reduced' : ''}</b></div>
@@ -510,6 +617,7 @@ DASHBOARD_HTML = """<!doctype html>
           </div>
           <div class="levels">
             ${level('Available cash', money(bot.cash))}
+            ${level('Position size', isOpen ? `${Number(bot.quantity).toFixed(6)} HYPE` : '—')}
             ${level('Average entry', price(bot.average_entry))}
             ${level('Take-profit', price(bot.target_price))}
             ${level('Liquidation', price(bot.liquidation_price))}
@@ -518,9 +626,25 @@ DASHBOARD_HTML = """<!doctype html>
             ${level('Max drawdown', bot.max_drawdown_pct.toFixed(2) + '%')}
           </div>
           <div class="action"><div class="label">Latest action</div><div>${bot.last_action}</div><div class="action-time">${time(bot.last_action_at)}</div></div>
+          <div class="controls">
+            <div class="control-heading">Manual paper controls</div>
+            <div class="control-row"><button onclick="controlBot(event, '${bot.bot_id}', '${paused ? 'resume' : 'pause'}')">${paused ? 'Resume automation' : 'Pause automation'}</button><span></span></div>
+            <div class="control-row"><input id="${buyId}" data-control-input type="number" min="0.01" step="0.01" placeholder="Margin in USD" aria-label="${bot.name} buy margin in USD"><button onclick="controlBot(event, '${bot.bot_id}', 'buy', '${buyId}')">Buy</button></div>
+            <div class="control-row"><input id="${sellId}" data-control-input type="number" min="0.000001" step="any" placeholder="HYPE quantity" aria-label="${bot.name} sell quantity" ${isOpen ? '' : 'disabled'}><button onclick="controlBot(event, '${bot.bot_id}', 'sell', '${sellId}')" ${isOpen ? '' : 'disabled'}>Sell</button></div>
+            <div class="control-row"><input id="${marginId}" data-control-input type="number" min="0.01" step="0.01" placeholder="Margin in USD" aria-label="${bot.name} added margin" ${isOpen ? '' : 'disabled'}><button onclick="controlBot(event, '${bot.bot_id}', 'add_margin', '${marginId}')" ${isOpen ? '' : 'disabled'}>Add margin</button></div>
+            <div class="control-message" id="message-${bot.bot_id}">${escapeHtml(controlMessages[bot.bot_id] || '')}</div>
+          </div>
           ${bot.last_error ? `<div class="error">Market-data issue: ${bot.last_error}</div>` : ''}
         </article>`;
       }).join('');
+      for (const [id, value] of Object.entries(savedInputValues)) {
+        const input = document.getElementById(id);
+        if (input) input.value = value;
+      }
+      for (const botId of Object.keys(pendingControls)) {
+        if (pendingControls[botId]) document.querySelectorAll(`[onclick*="${botId}"]`).forEach(control => control.disabled = true);
+      }
+      if (focusedId) document.getElementById(focusedId)?.focus({preventScroll:true});
     }
     async function refresh() {
       try { render(await (await fetch('/api/state', {cache:'no-store'})).json()); }
@@ -543,6 +667,28 @@ def build_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                 self._respond(HTTPStatus.OK, "application/json", body)
             else:
                 self._respond(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"Not found")
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/api/control":
+                self._respond(HTTPStatus.NOT_FOUND, "application/json", b'{"error":"Not found."}')
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length <= 0 or content_length > 4096:
+                    raise ValueError("Invalid request size.")
+                request = json.loads(self.rfile.read(content_length))
+                bot_id = str(request["bot_id"])
+                action = str(request["action"])
+                bot = next((item for item in state.bots if item._state_slug(item.definition.name) == bot_id), None)
+                if bot is None:
+                    raise ValueError("Unknown bot.")
+                amount = float(request["amount"]) if "amount" in request else None
+                bot.control(action, amount)
+                response = json.dumps({"ok": True, "bot": bot.snapshot()}).encode("utf-8")
+                self._respond(HTTPStatus.OK, "application/json; charset=utf-8", response)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                response = json.dumps({"error": str(error)}).encode("utf-8")
+                self._respond(HTTPStatus.BAD_REQUEST, "application/json; charset=utf-8", response)
 
         def log_message(self, format: str, *args: Any) -> None:
             return

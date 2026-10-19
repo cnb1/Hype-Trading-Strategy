@@ -51,6 +51,8 @@ This starts five independent paper-trading workers and a local dashboard at `htt
 
 Each bot saves its paper portfolio in its own JSON file under `trading_bots/state/`. On restart, it restores its cash, open position details, counters, and risk metrics before processing market data. The files are local runtime state and are excluded from Git. If a state file is missing, that bot starts with its configured starting cash and waits for its usual entry signal. These files track simulated positions only; the bots do not inspect or restore live exchange positions.
 
+The dashboard has controls on each bot card to pause or resume strategy trades, submit a manual paper buy using a USD margin amount, sell a HYPE quantity, or add USD collateral to an open position. While paused, automated entries, average-downs, and take-profit exits are disabled; liquidation monitoring remains active. Manual actions use the latest public HYPE mid price and are saved to that bot's JSON state immediately. Adding collateral reduces the modeled liquidation price without increasing position size. These controls only change paper portfolios; they do not send exchange orders.
+
 ## Layout
 
 ```text
