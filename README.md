@@ -53,6 +53,8 @@ Each bot saves its paper portfolio in its own JSON file under `trading_bots/stat
 
 The dashboard has controls on each bot card to pause or resume strategy trades, then choose Buy, Sell, or Add margin from one action menu. All manual inputs are in USD: Buy and Sell use position value, and Add margin uses collateral. A Buy uses 5x leverage, so its margin requirement is one-fifth of the entered position value. While paused, automated entries, average-downs, and take-profit exits are disabled; liquidation monitoring remains active. Manual actions use the latest public HYPE mid price and are saved to that bot's JSON state immediately. Adding collateral reduces the modeled liquidation price without increasing position size. These controls only change paper portfolios; they do not send exchange orders.
 
+The dashboard uses the full screen width, keeps all five bot cards in one row, and shows a HYPE hourly closing-price chart above them.
+
 Each bot card also has an expandable trade history with up to the latest 50 events. It records strategy and manual buys, sales, profitable or losing position closes, margin additions, and liquidations, including price, margin, leveraged value, quantity, realized P&L, and liquidation price after the event where applicable. New events are saved in the bot's JSON file. An already-open position from a state file without a history is shown as an imported position; older closed trades cannot be reconstructed if they were not previously logged.
 
 ## Layout

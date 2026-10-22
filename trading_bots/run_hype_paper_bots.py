@@ -77,6 +77,7 @@ BOT_STARTING_CASH = TOTAL_STARTING_CASH / len(BOT_DEFINITIONS)
 class MarketSnapshot:
     price: float | None
     rolling_high: float | None
+    price_history: list[dict[str, float]]
     fetched_at: float
     error: str | None = None
 
@@ -97,17 +98,18 @@ class MarketDataCache:
 
             try:
                 price = self._fetch_mid_price()
-                rolling_high = self._fetch_rolling_high(now)
+                rolling_high, price_history = self._fetch_price_history(now)
                 self._snapshot = MarketSnapshot(
                     price=price,
                     rolling_high=rolling_high,
+                    price_history=price_history,
                     fetched_at=now,
                 )
             except requests.RequestException as error:
                 if self._snapshot:
                     self._snapshot = replace(self._snapshot, fetched_at=now, error=str(error))
                 else:
-                    self._snapshot = MarketSnapshot(None, None, now, str(error))
+                    self._snapshot = MarketSnapshot(None, None, [], now, str(error))
             return self._snapshot
 
     @staticmethod
@@ -120,7 +122,7 @@ class MarketDataCache:
         mids = self._post({"type": "allMids"})
         return float(mids[COIN])
 
-    def _fetch_rolling_high(self, now: float) -> float:
+    def _fetch_price_history(self, now: float) -> tuple[float, list[dict[str, float]]]:
         end_time_ms = int(now * 1000)
         start_time_ms = end_time_ms - (LOOKBACK_HOURS + 2) * 60 * 60 * 1000
         candles = self._post(
@@ -138,7 +140,13 @@ class MarketDataCache:
         completed_candles = [candle for candle in candles if int(candle["t"]) < current_hour_start_ms]
         if not completed_candles:
             raise requests.RequestException("Hyperliquid returned no completed 1-hour candles.")
-        return max(float(candle["h"]) for candle in completed_candles[-LOOKBACK_HOURS:])
+        recent_candles = completed_candles[-LOOKBACK_HOURS:]
+        rolling_high = max(float(candle["h"]) for candle in recent_candles)
+        price_history = [
+            {"time": float(candle["t"]), "price": float(candle["c"])}
+            for candle in recent_candles
+        ]
+        return rolling_high, price_history
 
 
 class PaperBot(threading.Thread):
@@ -515,6 +523,18 @@ class PaperBot(threading.Thread):
             rolling_high = market.rolling_high if market else None
             current_equity = equity(self.cash, self.position, price) if price is not None else self.cash + self.position.margin_used
             profit = current_equity - BOT_STARTING_CASH
+            position_profit = (
+                self.position.unrealized_pnl(price)
+                if self.position.is_open and price is not None
+                else (0.0 if not self.position.is_open else None)
+            )
+            position_profit_pct = (
+                position_profit / self.position.margin_used * 100.0
+                if position_profit is not None and self.position.margin_used > 0
+                else (0.0 if not self.position.is_open else None)
+            )
+            first_buy_basis = self.cycle_start_equity if self.position.is_open else self.cash
+            first_buy_margin = first_buy_basis * self.definition.params.first_buy_fraction
             initial_trigger = (
                 rolling_high * (1.0 - self.definition.params.initial_drop_pct / 100.0)
                 if rolling_high is not None
@@ -535,17 +555,24 @@ class PaperBot(threading.Thread):
                     "recurring_buy_pct": self.definition.params.recurring_buy_fraction * 100.0,
                     "take_profit_margin_pct": self.definition.params.take_profit_margin_pct,
                 },
+                "first_buy_label": "Current cycle first buy" if self.position.is_open else "Next first buy estimate",
+                "first_buy_margin": first_buy_margin,
+                "first_buy_position_value": first_buy_margin * LEVERAGE,
+                "first_buy_basis": first_buy_basis,
                 "bot_id": self._state_slug(self.definition.name),
                 "position_open": self.position.is_open,
                 "trading_enabled": self.trading_enabled,
                 "status": ("In position" if self.position.is_open else "Waiting for dip")
                           if self.trading_enabled else ("Paused · in position" if self.position.is_open else "Paused"),
                 "price": price,
+                "price_history": market.price_history if market else [],
                 "rolling_high": rolling_high,
                 "initial_trigger": initial_trigger,
                 "portfolio_equity": current_equity,
                 "profit": profit,
                 "profit_pct": profit / BOT_STARTING_CASH * 100.0,
+                "position_profit": position_profit,
+                "position_profit_pct": position_profit_pct,
                 "starting_cash": BOT_STARTING_CASH,
                 "cash": self.cash,
                 "margin_used": self.position.margin_used,
@@ -602,19 +629,37 @@ DASHBOARD_HTML = """<!doctype html>
     :root { color-scheme: dark; --bg:#0f1116; --panel:#181b23; --line:#2a2f3a; --text:#f0f2f5; --muted:#9299a8; --up:#16c784; --down:#ea3943; --blue:#4c8bf5; --amber:#f0b90b; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    header { display:flex; justify-content:space-between; gap:20px; align-items:flex-end; padding:26px max(24px, calc((100vw - 1500px)/2)); border-bottom:1px solid var(--line); }
+    header { display:flex; justify-content:space-between; gap:20px; align-items:flex-end; padding:clamp(12px, 2vw, 26px) clamp(10px, 2vw, 32px); border-bottom:1px solid var(--line); }
     h1 { margin:0; font-size:22px; letter-spacing:0; }
     .subtitle, .updated { color:var(--muted); margin-top:5px; font-size:12px; }
     .updated { text-align:right; }
-    main { max-width:1500px; margin:0 auto; padding:20px 24px 36px; }
+    main { width:100%; max-width:none; margin:0; padding:clamp(8px, 1vw, 16px); }
     .market { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); border:1px solid var(--line); background:var(--panel); }
     .market-item { padding:14px 16px; border-right:1px solid var(--line); min-height:70px; }
     .market-item:last-child { border-right:0; }
+    .chart-panel { margin-top:12px; padding:12px 14px 8px; border:1px solid var(--line); background:var(--panel); }
+    .chart-heading { display:flex; justify-content:space-between; align-items:baseline; gap:12px; color:var(--text); font-size:12px; }
+    .chart-heading span { color:var(--muted); font-variant-numeric:tabular-nums; }
+    .price-chart { height:clamp(135px, 21vh, 260px); margin-top:5px; }
+    .price-chart svg { display:block; width:100%; height:100%; }
+    .chart-grid { stroke:#2a2f3a; stroke-width:1; }
+    .chart-line { fill:none; stroke:var(--blue); stroke-width:2.5; vector-effect:non-scaling-stroke; }
+    .chart-dot { fill:var(--blue); }
+    .chart-axis-label { fill:var(--muted); font-size:11px; font-family:inherit; }
+    .chart-empty { height:100%; display:grid; place-items:center; color:var(--muted); font-size:12px; }
     .label { color:var(--muted); text-transform:uppercase; letter-spacing:.04em; font-size:clamp(8px, .65vw + 3px, 10px); font-weight:700; }
     .value { margin-top:5px; font-size:18px; font-variant-numeric:tabular-nums; }
     .grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:clamp(4px, .8vw, 12px); margin-top:16px; align-items:start; }
     .bot { border:1px solid var(--line); background:var(--panel); min-width:0; }
     .bot-header { display:flex; justify-content:space-between; align-items:center; padding:14px 14px 12px; border-bottom:1px solid var(--line); }
+    .first-buy-stat { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line); background:rgba(76,139,245,.06); }
+    .first-buy-copy { min-width:0; }
+    .first-buy-label { color:var(--muted); font-size:clamp(8px, .65vw + 3px, 10px); text-transform:uppercase; letter-spacing:.04em; }
+    .first-buy-basis { color:var(--muted); font-size:clamp(8px, .65vw + 3px, 10px); margin-top:3px; }
+    .first-buy-values { text-align:right; min-width:0; font-variant-numeric:tabular-nums; }
+    .first-buy-margin, .first-buy-notional { overflow-wrap:anywhere; }
+    .first-buy-margin { color:var(--text); font-size:clamp(11px, 1vw + 4px, 16px); font-weight:700; }
+    .first-buy-notional { color:var(--blue); font-size:clamp(8px, .7vw + 3px, 11px); margin-top:2px; }
     .bot-name { font-size:clamp(9px, 1vw + 4px, 16px); font-weight:700; }
     .badge { border:1px solid var(--line); color:var(--muted); padding:4px 7px; font-size:10px; white-space:nowrap; }
     .badge.open { color:var(--up); border-color:rgba(22,199,132,.35); background:rgba(22,199,132,.08); }
@@ -669,6 +714,10 @@ DASHBOARD_HTML = """<!doctype html>
   </header>
   <main>
     <section class="market" id="market"></section>
+    <section class="chart-panel">
+      <div class="chart-heading"><strong>HYPE / USD · 1-hour candles</strong><span id="chart-last-price">Waiting for market data...</span></div>
+      <div class="price-chart" id="price-chart"><div class="chart-empty">Loading HYPE price history...</div></div>
+    </section>
     <section class="grid" id="bots"></section>
   </main>
   <script>
@@ -680,6 +729,40 @@ DASHBOARD_HTML = """<!doctype html>
     const color = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
     const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const level = (label, value) => `<div class="level"><span>${label}</span><span>${value}</span></div>`;
+    function renderPriceChart(bot) {
+      const chart = document.getElementById('price-chart');
+      const priceLabel = document.getElementById('chart-last-price');
+      const history = (bot.price_history || []).map(point => ({time:Number(point.time), price:Number(point.price)}))
+        .filter(point => Number.isFinite(point.time) && Number.isFinite(point.price));
+      if (bot.price != null && Number.isFinite(Number(bot.price))) {
+        history.push({time:Number(bot.market_updated_at || Date.now() / 1000) * 1000, price:Number(bot.price)});
+      }
+      if (history.length < 2) {
+        chart.innerHTML = '<div class="chart-empty">Price history will appear after completed hourly candles load.</div>';
+        priceLabel.textContent = bot.price == null ? 'Waiting for market data...' : price(bot.price);
+        return;
+      }
+      const width = 1200, height = 240, left = 68, right = 16, top = 12, bottom = 28;
+      const values = history.map(point => point.price);
+      const low = Math.min(...values), high = Math.max(...values);
+      const spread = Math.max(high - low, high * 0.002, 0.0001);
+      const min = low - spread * 0.08, max = high + spread * 0.08;
+      const x = index => left + index * (width - left - right) / (history.length - 1);
+      const y = value => top + (max - value) * (height - top - bottom) / (max - min);
+      const path = history.map((point, index) => `${index ? 'L' : 'M'}${x(index).toFixed(1)},${y(point.price).toFixed(1)}`).join(' ');
+      const grid = Array.from({length:5}, (_, index) => {
+        const value = max - index * (max - min) / 4;
+        const yy = y(value).toFixed(1);
+        return `<line class="chart-grid" x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}"/><text class="chart-axis-label" x="${left-8}" y="${Number(yy)+4}" text-anchor="end">${price(value)}</text>`;
+      }).join('');
+      const last = history[history.length - 1];
+      chart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="HYPE hourly price chart">
+        ${grid}<path class="chart-line" d="${path}"/><circle class="chart-dot" cx="${x(history.length-1)}" cy="${y(last.price)}" r="4"/>
+        <text class="chart-axis-label" x="${left}" y="${height-5}">${new Date(history[0].time).toLocaleDateString()}</text>
+        <text class="chart-axis-label" x="${width-right}" y="${height-5}" text-anchor="end">${new Date(last.time).toLocaleString()}</text>
+      </svg>`;
+      priceLabel.textContent = `Current mid ${price(bot.price)} · ${history.length - (bot.price != null ? 1 : 0)} hourly candles`;
+    }
     const eventLabel = trade => {
       if (trade.event === 'position_closed') return trade.profitable_close ? 'Position closed · profit' : 'Position closed';
       return ({buy:'Buy', average_down:'Average down', sell:'Sell', liquidation:'Liquidation', margin_added:'Margin added', position_imported:'Imported position'}[trade.event] || trade.event);
@@ -743,6 +826,7 @@ DASHBOARD_HTML = """<!doctype html>
         ['HYPE mid', price(first.price), 'neutral'], ['96h rolling high', price(first.rolling_high), 'neutral'],
         ['Leverage', data.leverage.toFixed(1) + 'x', 'neutral'], ['Mode', 'Paper trading', 'neutral']
       ].map(([label, value, valueClass]) => `<div class="market-item"><div class="label">${label}</div><div class="value ${valueClass}">${value}</div></div>`).join('');
+      renderPriceChart(first);
       document.getElementById('bots').innerHTML = data.bots.map(bot => {
         const p = bot.parameters;
         const isOpen = bot.position_open;
@@ -763,13 +847,18 @@ DASHBOARD_HTML = """<!doctype html>
         </tr>`).join('');
         return `<article class="bot">
           <div class="bot-header"><div class="bot-name">${bot.name}</div><div class="badge ${paused ? 'paused' : (isOpen ? 'open' : '')}">${bot.status}</div></div>
+          <div class="first-buy-stat">
+            <div class="first-buy-copy"><div class="first-buy-label">${bot.first_buy_label}</div><div class="first-buy-basis">${(bot.parameters.first_buy_pct).toFixed(1)}% of ${money(bot.first_buy_basis)}</div></div>
+            <div class="first-buy-values"><div class="first-buy-margin">${money(bot.first_buy_margin)} margin</div><div class="first-buy-notional">${money(bot.first_buy_position_value)} position value at 5×</div></div>
+          </div>
           <div class="params">
             <div class="param">Initial dip<b>${p.initial_drop_pct}%</b></div><div class="param">Recurring dip<b>${p.recurring_drop_pct}%</b></div>
             <div class="param">First / recurring<b>${p.first_buy_pct}% / ${p.recurring_buy_pct}%</b></div><div class="param">Margin target<b>${p.take_profit_margin_pct}%${bot.reduced_target ? ' reduced' : ''}</b></div>
           </div>
           <div class="metrics">
             <div class="metric"><div class="label">Portfolio</div><div class="value">${money(bot.portfolio_equity)}</div></div>
-            <div class="metric"><div class="label">P&amp;L</div><div class="value ${color(bot.profit)}">${signed(bot.profit)}<br><small>${bot.profit_pct >= 0 ? '+' : ''}${bot.profit_pct.toFixed(2)}%</small></div></div>
+            <div class="metric"><div class="label">Total P&amp;L</div><div class="value ${color(bot.profit)}">${signed(bot.profit)}<br><small>${bot.profit_pct >= 0 ? '+' : ''}${bot.profit_pct.toFixed(2)}%</small></div></div>
+            <div class="metric"><div class="label">Current position P&amp;L</div><div class="value ${color(bot.position_profit || 0)}">${bot.position_profit == null ? '—' : signed(bot.position_profit)}<br><small>${bot.position_profit_pct == null ? '—' : `${bot.position_profit_pct >= 0 ? '+' : ''}${bot.position_profit_pct.toFixed(2)}% of margin`}</small></div></div>
             <div class="metric"><div class="label">Margin used</div><div class="value">${money(bot.margin_used)}</div></div>
             <div class="metric"><div class="label">5x position</div><div class="value">${money(bot.notional)}</div></div>
           </div>

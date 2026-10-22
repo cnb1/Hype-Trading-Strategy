@@ -18,12 +18,12 @@ import pandas as pd
 
 from optimize_scalping_strategy import (
     CSV_PATH,
-    LEVERAGE,
     STARTING_CASH,
     BacktestResult,
     StrategyParams,
     backtest,
     format_result,
+    leverage_values,
     load_candles,
     parameter_grid,
 )
@@ -32,8 +32,6 @@ from optimize_scalping_strategy import (
 @dataclass(frozen=True)
 class WorkerSettings:
     starting_cash: float
-    leverage: float
-    liquidation_drop_pct: float
     max_cycle_margin_pct: float
     reduced_target_margin_threshold_pct: float
     reduced_target_multiplier: float
@@ -52,15 +50,15 @@ def initialize_worker(candles: pd.DataFrame, settings: WorkerSettings) -> None:
     _SETTINGS = settings
 
 
-def evaluate_parameter_set(params: StrategyParams) -> BacktestResult:
+def evaluate_parameter_set(task: tuple[float, StrategyParams]) -> BacktestResult:
     if _CANDLES is None or _SETTINGS is None:
         raise RuntimeError("Parallel optimizer worker was not initialized.")
+    leverage, params = task
     return backtest(
         _CANDLES,
         params,
         starting_cash=_SETTINGS.starting_cash,
-        leverage=_SETTINGS.leverage,
-        liquidation_drop_pct=_SETTINGS.liquidation_drop_pct,
+        leverage=leverage,
         max_cycle_margin_pct=_SETTINGS.max_cycle_margin_pct,
         reduced_target_margin_threshold_pct=_SETTINGS.reduced_target_margin_threshold_pct,
         reduced_target_multiplier=_SETTINGS.reduced_target_multiplier,
@@ -75,8 +73,8 @@ def parse_args() -> argparse.Namespace:
         description="Optimize the HYPE scalping strategy across multiple CPU processes."
     )
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH)
-    parser.add_argument("--leverage", type=float, default=LEVERAGE)
-    parser.add_argument("--liquidation-drop-pct", type=float, default=15.0)
+    parser.add_argument("--leverages", default="5,6", help="Leverage values to test (default: 5,6).")
+    parser.add_argument("--leverage", type=float, help="Test one leverage value instead of the --leverages grid.")
     parser.add_argument(
         "--max-cycle-margin-pct",
         type=float,
@@ -121,8 +119,6 @@ def parse_args() -> argparse.Namespace:
 def settings_from_args(args: argparse.Namespace) -> WorkerSettings:
     return WorkerSettings(
         starting_cash=args.starting_cash,
-        leverage=args.leverage,
-        liquidation_drop_pct=args.liquidation_drop_pct,
         max_cycle_margin_pct=args.max_cycle_margin_pct,
         reduced_target_margin_threshold_pct=args.reduced_target_margin_threshold_pct,
         reduced_target_multiplier=args.reduced_target_multiplier,
@@ -131,9 +127,10 @@ def settings_from_args(args: argparse.Namespace) -> WorkerSettings:
     )
 
 
-def print_queued(run_number: int, total: int, params: StrategyParams) -> None:
+def print_queued(run_number: int, total: int, params: StrategyParams, leverage: float) -> None:
     print(
         f"[{run_number:,}/{total:,}] Queued "
+        f"leverage={leverage:.1f}x, "
         f"initial_drop={params.initial_drop_pct:.2f}%, "
         f"recurring_drop={params.recurring_drop_pct:.2f}%, "
         f"first_buy={params.first_buy_fraction * 100:.2f}%, "
@@ -152,7 +149,7 @@ def main() -> None:
     settings = settings_from_args(args)
     print(f"Loaded {len(candles):,} candles from {CSV_PATH}")
     print(
-        f"Starting cash=${args.starting_cash:,.2f}, leverage={args.leverage:.1f}x, "
+        f"Starting cash=${args.starting_cash:,.2f}, leverage values={', '.join(f'{value:g}x' for value in leverage_values(args))}, "
         f"workers={args.workers}, combinations={len(params_to_try):,}."
     )
     print("Results print as workers finish, so completion order is intentionally not parameter-grid order.\n")
@@ -163,19 +160,19 @@ def main() -> None:
         initializer=initialize_worker,
         initargs=(candles, settings),
     ) as executor:
-        futures: dict[Any, tuple[int, StrategyParams]] = {}
-        for run_number, params in enumerate(params_to_try, start=1):
-            print_queued(run_number, len(params_to_try), params)
-            futures[executor.submit(evaluate_parameter_set, params)] = (run_number, params)
+        futures: dict[Any, tuple[int, float, StrategyParams]] = {}
+        for run_number, (leverage, params) in enumerate(params_to_try, start=1):
+            print_queued(run_number, len(params_to_try), params, leverage)
+            futures[executor.submit(evaluate_parameter_set, (leverage, params))] = (run_number, leverage, params)
 
         for future in as_completed(futures):
-            run_number, params = futures[future]
+            run_number, leverage, params = futures[future]
             result = future.result()
             results.append(result)
             print(
                 f"    [{run_number:,}/{len(params_to_try):,}] Finished "
                 f"profit=${result.profit:,.2f} ({result.profit_pct:.2f}%) "
-                f"for initial={params.initial_drop_pct:.2f}%, recurring={params.recurring_drop_pct:.2f}%, "
+                f"for leverage={leverage:.1f}x, initial={params.initial_drop_pct:.2f}%, recurring={params.recurring_drop_pct:.2f}%, "
                 f"first={params.first_buy_fraction * 100:.2f}%, recurring_buy={params.recurring_buy_fraction * 100:.2f}%, "
                 f"TP={params.take_profit_margin_pct:.2f}%"
             )

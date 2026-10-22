@@ -64,7 +64,6 @@ def parse_args() -> argparse.Namespace:
         help="Average-down margin allocation as a percent (for example 5) or decimal (0.05).",
     )
     parser.add_argument("--take-profit-margin-pct", type=float, required=True)
-    parser.add_argument("--liquidation-drop-pct", type=float, default=15.0)
     parser.add_argument("--max-cycle-margin-pct", type=float, default=12.0)
     parser.add_argument(
         "--reduced-target-margin-threshold-pct",
@@ -293,7 +292,6 @@ def main() -> None:
         params,
         starting_cash=args.starting_cash,
         leverage=args.leverage,
-        liquidation_drop_pct=args.liquidation_drop_pct,
         max_cycle_margin_pct=args.max_cycle_margin_pct,
         reduced_target_margin_threshold_pct=args.reduced_target_margin_threshold_pct,
         reduced_target_multiplier=args.reduced_target_multiplier,

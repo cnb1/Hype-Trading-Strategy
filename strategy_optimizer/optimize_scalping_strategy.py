@@ -33,6 +33,8 @@ from hype_candles import update_hype_csv  # noqa: E402
 
 STARTING_CASH = 15_000.0
 LEVERAGE = 5.0
+HYPE_MAX_LEVERAGE = 10.0
+HYPE_MAINTENANCE_MARGIN_RATE = 1.0 / (2.0 * HYPE_MAX_LEVERAGE)
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,7 @@ class Position:
 @dataclass
 class BacktestResult:
     params: StrategyParams
+    leverage: float
     final_equity: float
     profit: float
     profit_pct: float
@@ -189,6 +192,11 @@ def maintenance_margin_rate(leverage: float, initial_liquidation_drop_pct: float
     return rate
 
 
+def hype_maintenance_margin_rate() -> float:
+    """HYPE's 5% maintenance rate in its <=$20M notional margin tier."""
+    return HYPE_MAINTENANCE_MARGIN_RATE
+
+
 def liquidation_price(position: Position, maintenance_rate: float) -> float:
     """Compute isolated-long liquidation from the live average entry and margin."""
     if not position.is_open:
@@ -222,7 +230,6 @@ def simulate_strategy(
     *,
     starting_cash: float,
     leverage: float,
-    liquidation_drop_pct: float,
     max_cycle_margin_pct: float,
     reduced_target_margin_threshold_pct: float,
     reduced_target_multiplier: float,
@@ -243,7 +250,7 @@ def simulate_strategy(
     margin_trimmed = 0.0
     reduced_target_exits = 0
     cycle_start_equity = 0.0
-    maintenance_rate = maintenance_margin_rate(leverage, liquidation_drop_pct)
+    maintenance_rate = hype_maintenance_margin_rate()
     lookback_candles = max(1, -(-dip_lookback_hours // CANDLE_INTERVAL_HOURS))
     events: list[TradeEvent] = []
 
@@ -458,6 +465,7 @@ def simulate_strategy(
     profit = final_equity - starting_cash
     result = BacktestResult(
         params=params,
+        leverage=leverage,
         final_equity=final_equity,
         profit=profit,
         profit_pct=profit / starting_cash * 100.0,
@@ -480,7 +488,6 @@ def backtest(
     *,
     starting_cash: float,
     leverage: float,
-    liquidation_drop_pct: float,
     max_cycle_margin_pct: float,
     reduced_target_margin_threshold_pct: float,
     reduced_target_multiplier: float,
@@ -492,7 +499,6 @@ def backtest(
         params,
         starting_cash=starting_cash,
         leverage=leverage,
-        liquidation_drop_pct=liquidation_drop_pct,
         max_cycle_margin_pct=max_cycle_margin_pct,
         reduced_target_margin_threshold_pct=reduced_target_margin_threshold_pct,
         reduced_target_multiplier=reduced_target_multiplier,
@@ -501,16 +507,20 @@ def backtest(
     ).result
 
 
-def parameter_grid(args: argparse.Namespace) -> Iterable[StrategyParams]:
+def parameter_grid(args: argparse.Namespace) -> Iterable[tuple[float, StrategyParams]]:
     return (
-        StrategyParams(
-            initial_drop_pct=initial_drop,
-            recurring_drop_pct=recurring_drop,
-            first_buy_fraction=first_fraction,
-            recurring_buy_fraction=recurring_fraction,
-            take_profit_margin_pct=take_profit,
+        (
+            leverage,
+            StrategyParams(
+                initial_drop_pct=initial_drop,
+                recurring_drop_pct=recurring_drop,
+                first_buy_fraction=first_fraction,
+                recurring_buy_fraction=recurring_fraction,
+                take_profit_margin_pct=take_profit,
+            ),
         )
-        for initial_drop, recurring_drop, first_fraction, recurring_fraction, take_profit in itertools.product(
+        for leverage, initial_drop, recurring_drop, first_fraction, recurring_fraction, take_profit in itertools.product(
+            leverage_values(args),
             percent_values(args.initial_drop_pcts),
             percent_values(args.recurring_drop_pcts),
             fraction_values(args.first_buy_fractions),
@@ -523,6 +533,7 @@ def parameter_grid(args: argparse.Namespace) -> Iterable[StrategyParams]:
 def format_result(result: BacktestResult) -> str:
     params = result.params
     return (
+        f"leverage={result.leverage:.1f}x | "
         f"initial_drop={params.initial_drop_pct:.2f}% | "
         f"recurring_drop={params.recurring_drop_pct:.2f}% | "
         f"first_buy={params.first_buy_fraction * 100:.2f}% | "
@@ -540,11 +551,11 @@ def format_result(result: BacktestResult) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Optimize a 5x leveraged dip-buying HYPE scalping strategy over 1-hour candles."
+        description="Optimize a leveraged dip-buying HYPE scalping strategy over 1-hour candles."
     )
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH)
-    parser.add_argument("--leverage", type=float, default=LEVERAGE)
-    parser.add_argument("--liquidation-drop-pct", type=float, default=15.0)
+    parser.add_argument("--leverages", default="5,6", help="Leverage values to test (default: 5,6).")
+    parser.add_argument("--leverage", type=float, help="Test one leverage value instead of the --leverages grid.")
     parser.add_argument(
         "--max-cycle-margin-pct",
         type=float,
@@ -585,13 +596,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def leverage_values(args: argparse.Namespace) -> list[float]:
+    values = [args.leverage] if args.leverage is not None else percent_values(args.leverages)
+    if not values or any(value <= 1 for value in values):
+        raise ValueError("Leverage values must be greater than 1.")
+    return values
+
+
 def main() -> None:
     args = parse_args()
     candles = load_candles(update_csv=not args.no_update)
     print(f"Loaded {len(candles):,} candles from {CSV_PATH}")
     print(
-        f"Starting cash=${args.starting_cash:,.2f}, leverage={args.leverage:.1f}x, "
-        f"initial liquidation modeled at {args.liquidation_drop_pct:.2f}% below entry, "
+        f"Starting cash=${args.starting_cash:,.2f}, leverage values={', '.join(f'{value:g}x' for value in leverage_values(args))}, "
+        f"HYPE maintenance margin rate={HYPE_MAINTENANCE_MARGIN_RATE:.2%} (10x max-leverage tier), "
         f"with a {args.max_cycle_margin_pct:.2f}% cycle margin cap and "
         f"a {args.reduced_target_multiplier:.2f}x take-profit target at "
         f"{args.reduced_target_margin_threshold_pct:.2f}% current margin exposure."
@@ -601,9 +619,10 @@ def main() -> None:
     params_to_try = list(parameter_grid(args))
     print(f"Trying {len(params_to_try):,} parameter combinations...\n")
 
-    for run_number, params in enumerate(params_to_try, start=1):
+    for run_number, (leverage, params) in enumerate(params_to_try, start=1):
         print(
             f"[{run_number:,}/{len(params_to_try):,}] Trying "
+            f"leverage={leverage:.1f}x, "
             f"initial_drop={params.initial_drop_pct:.2f}%, "
             f"recurring_drop={params.recurring_drop_pct:.2f}%, "
             f"first_buy={params.first_buy_fraction * 100:.2f}%, "
@@ -614,8 +633,7 @@ def main() -> None:
             candles,
             params,
             starting_cash=args.starting_cash,
-            leverage=args.leverage,
-            liquidation_drop_pct=args.liquidation_drop_pct,
+            leverage=leverage,
             max_cycle_margin_pct=args.max_cycle_margin_pct,
             reduced_target_margin_threshold_pct=args.reduced_target_margin_threshold_pct,
             reduced_target_multiplier=args.reduced_target_multiplier,
