@@ -31,6 +31,7 @@ if str(OPTIMIZER_DIR) not in sys.path:
     sys.path.insert(0, str(OPTIMIZER_DIR))
 
 from optimize_scalping_strategy import (  # noqa: E402
+    HYPE_MAX_LEVERAGE,
     LEVERAGE,
     Position,
     StrategyParams,
@@ -38,6 +39,7 @@ from optimize_scalping_strategy import (  # noqa: E402
     close_position,
     enforce_margin_cap,
     equity,
+    hype_maintenance_margin_rate,
     liquidation_price,
     maintenance_margin_rate,
 )
@@ -46,14 +48,15 @@ from optimize_scalping_strategy import (  # noqa: E402
 API_URL = "https://api.hyperliquid.xyz/info"
 COIN = "HYPE"
 LOOKBACK_HOURS = 96
-LIQUIDATION_DROP_PCT = 15.0
+DEFAULT_BOT_LEVERAGE = 7.0
+LEGACY_INITIAL_LIQUIDATION_DROP_PCT = 15.0
 MAX_CYCLE_MARGIN_PCT = 12.0
 REDUCED_TARGET_MARGIN_THRESHOLD_PCT = 12.0
 REDUCED_TARGET_MULTIPLIER = 0.5
 MAX_ADDITIONAL_BUYS = 15
 TOTAL_STARTING_CASH = 100_000.0
 STATE_DIR = Path(__file__).resolve().parent / "state"
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_TRADE_HISTORY = 50
 
 
@@ -64,11 +67,11 @@ class BotDefinition:
 
 
 BOT_DEFINITIONS = (
-    BotDefinition("Bot 1", StrategyParams(8.0, 4.0, 0.10, 0.05, 10.0)),
-    BotDefinition("Bot 2", StrategyParams(5.0, 3.0, 0.10, 0.025, 10.0)),
-    BotDefinition("Bot 3", StrategyParams(5.0, 5.0, 0.075, 0.05, 20.0)),
-    BotDefinition("Bot 4", StrategyParams(8.0, 5.0, 0.10, 0.075, 10.0)),
-    BotDefinition("Bot 5", StrategyParams(5.0, 4.0, 0.10, 0.075, 30.0)),
+    BotDefinition("Bot 1", StrategyParams(8.0, 2.0, 0.10, 0.025, 10.0)),
+    BotDefinition("Bot 2", StrategyParams(8.0, 2.0, 0.10, 0.025, 15.0)),
+    BotDefinition("Bot 3", StrategyParams(8.0, 2.0, 0.075, 0.025, 10.0)),
+    BotDefinition("Bot 4", StrategyParams(8.0, 3.0, 0.10, 0.05, 10.0)),
+    BotDefinition("Bot 5", StrategyParams(8.0, 4.0, 0.10, 0.075, 25.0)),
 )
 BOT_STARTING_CASH = TOTAL_STARTING_CASH / len(BOT_DEFINITIONS)
 
@@ -85,8 +88,9 @@ class MarketSnapshot:
 class MarketDataCache:
     """Shares one public API snapshot among the five paper-trading threads."""
 
-    def __init__(self, refresh_seconds: float) -> None:
+    def __init__(self, refresh_seconds: float, lookback_hours: int) -> None:
         self.refresh_seconds = refresh_seconds
+        self.lookback_hours = lookback_hours
         self._lock = threading.Lock()
         self._snapshot: MarketSnapshot | None = None
 
@@ -124,7 +128,7 @@ class MarketDataCache:
 
     def _fetch_price_history(self, now: float) -> tuple[float, list[dict[str, float]]]:
         end_time_ms = int(now * 1000)
-        start_time_ms = end_time_ms - (LOOKBACK_HOURS + 2) * 60 * 60 * 1000
+        start_time_ms = end_time_ms - (self.lookback_hours + 2) * 60 * 60 * 1000
         candles = self._post(
             {
                 "type": "candleSnapshot",
@@ -140,7 +144,7 @@ class MarketDataCache:
         completed_candles = [candle for candle in candles if int(candle["t"]) < current_hour_start_ms]
         if not completed_candles:
             raise requests.RequestException("Hyperliquid returned no completed 1-hour candles.")
-        recent_candles = completed_candles[-LOOKBACK_HOURS:]
+        recent_candles = completed_candles[-self.lookback_hours:]
         rolling_high = max(float(candle["h"]) for candle in recent_candles)
         price_history = [
             {"time": float(candle["t"]), "price": float(candle["c"])}
@@ -158,17 +162,22 @@ class PaperBot(threading.Thread):
         market_data: MarketDataCache,
         poll_seconds: float,
         stop_event: threading.Event,
+        next_cycle_leverage: float,
+        dip_lookback_hours: int,
     ) -> None:
         super().__init__(name=definition.name, daemon=True)
         self.definition = definition
         self.market_data = market_data
         self.poll_seconds = poll_seconds
         self.stop_event = stop_event
+        self.next_cycle_leverage = next_cycle_leverage
+        self.dip_lookback_hours = dip_lookback_hours
         self._lock = threading.Lock()
         self.cash = BOT_STARTING_CASH
         self.position = Position()
         self.cycle_start_equity = BOT_STARTING_CASH
-        self.maintenance_rate = maintenance_margin_rate(LEVERAGE, LIQUIDATION_DROP_PCT)
+        self.cycle_leverage: float | None = None
+        self.maintenance_rate = hype_maintenance_margin_rate()
         self.buys = 0
         self.closed_cycles = 0
         self.wins = 0
@@ -191,13 +200,27 @@ class PaperBot(threading.Thread):
     def _state_slug(name: str) -> str:
         return "".join(character.lower() if character.isalnum() else "-" for character in name).strip("-")
 
+    @property
+    def active_leverage(self) -> float:
+        """Use the cycle's locked leverage until its position is fully closed."""
+        return self.cycle_leverage if self.position.is_open and self.cycle_leverage is not None else self.next_cycle_leverage
+
+    def _start_cycle(self) -> None:
+        self.cycle_start_equity = self.cash
+        self.cycle_leverage = self.next_cycle_leverage
+        self.maintenance_rate = hype_maintenance_margin_rate()
+
+    def _finish_cycle(self) -> None:
+        self.cycle_leverage = None
+        self.maintenance_rate = hype_maintenance_margin_rate()
+
     def _load_state(self) -> None:
         """Restore this paper bot's portfolio and counters after a restart."""
         if not self.state_path.exists():
             return
         try:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if state.get("version") != STATE_VERSION or state.get("bot") != self.definition.name:
+            if state.get("version") not in {1, STATE_VERSION} or state.get("bot") != self.definition.name:
                 raise ValueError("state version or bot identity does not match")
             values = state["portfolio"]
             self.cash = float(values["cash"])
@@ -206,6 +229,13 @@ class PaperBot(threading.Thread):
             self.position = Position(**{key: float(position[key]) if key != "buy_count" else int(position[key])
                                         for key in ("margin_used", "notional", "quantity", "average_entry",
                                                     "first_entry", "last_buy_price", "buy_count")})
+            if self.position.is_open:
+                # Version 1 had a fixed 5x bot configuration and did not save this field.
+                self.cycle_leverage = float(values.get("cycle_leverage", LEVERAGE))
+                self.maintenance_rate = float(values.get(
+                    "cycle_maintenance_rate",
+                    maintenance_margin_rate(LEVERAGE, LEGACY_INITIAL_LIQUIDATION_DROP_PCT),
+                ))
             for name in ("buys", "closed_cycles", "wins", "liquidations", "partial_reductions",
                          "reduced_target_exits"):
                 setattr(self, name, int(values.get(name, 0)))
@@ -241,6 +271,8 @@ class PaperBot(threading.Thread):
             "portfolio": {
                 "cash": self.cash,
                 "cycle_start_equity": self.cycle_start_equity,
+                "cycle_leverage": self.cycle_leverage,
+                "cycle_maintenance_rate": self.maintenance_rate if self.position.is_open else None,
                 "position": {"margin_used": position.margin_used, "notional": position.notional,
                              "quantity": position.quantity, "average_entry": position.average_entry,
                              "first_entry": position.first_entry, "last_buy_price": position.last_buy_price,
@@ -291,6 +323,7 @@ class PaperBot(threading.Thread):
         quantity: float,
         realized_pnl: float | None = None,
         position_closed: bool = False,
+        leverage: float | None = None,
     ) -> None:
         self.trade_history.append({
             "timestamp": time.time(),
@@ -299,7 +332,7 @@ class PaperBot(threading.Thread):
             "reason": reason,
             "price": price,
             "margin": margin,
-            "leverage": LEVERAGE,
+            "leverage": self.active_leverage if leverage is None else leverage,
             "leveraged_value": leveraged_value,
             "quantity": quantity,
             "realized_pnl": realized_pnl,
@@ -317,7 +350,7 @@ class PaperBot(threading.Thread):
     def _buy(self, margin_amount: float, fill_price: float, action: str, source: str = "strategy") -> None:
         was_open = self.position.is_open
         self.cash -= margin_amount
-        self.position.add_buy(margin_amount, fill_price, LEVERAGE)
+        self.position.add_buy(margin_amount, fill_price, self.active_leverage)
         self.buys += 1
         self._record_action(action)
         self._record_trade(
@@ -326,8 +359,8 @@ class PaperBot(threading.Thread):
             reason="average_down" if was_open and source == "strategy" else ("manual_buy" if source == "manual" else "entry"),
             price=fill_price,
             margin=margin_amount,
-            leveraged_value=margin_amount * LEVERAGE,
-            quantity=margin_amount * LEVERAGE / fill_price,
+            leveraged_value=margin_amount * self.active_leverage,
+            quantity=margin_amount * self.active_leverage / fill_price,
         )
 
     def control(self, action: str, amount: float | None = None) -> None:
@@ -347,13 +380,13 @@ class PaperBot(threading.Thread):
                     raise ValueError("Market price is not available yet.")
                 price = market.price
                 if action == "buy":
-                    margin_amount = amount / LEVERAGE
+                    margin_amount = amount / self.next_cycle_leverage if not self.position.is_open else amount / self.active_leverage
                     if margin_amount > self.cash:
                         raise ValueError(
                             f"This buy needs ${margin_amount:,.2f} margin, but only ${self.cash:,.2f} is available."
                         )
                     if not self.position.is_open:
-                        self.cycle_start_equity = self.cash
+                        self._start_cycle()
                     self._buy(
                         margin_amount, price,
                         f"Manual paper buy of ${amount:,.2f} position value using ${margin_amount:,.2f} margin at ${price:,.4f}.",
@@ -382,12 +415,14 @@ class PaperBot(threading.Thread):
                     quantity_sold = self.position.quantity if current_position_value - amount <= 0.01 else amount / price
                     was_fully_closed = quantity_sold >= self.position.quantity
                     margin_released = self.position.margin_used * quantity_sold / self.position.quantity
+                    cycle_leverage = self.active_leverage
                     self.cash, realized_pnl = close_quantity(self.cash, self.position, quantity_sold, price)
                     self._record_trade(
                         "position_closed" if was_fully_closed else "sell",
                         source="manual", reason="manual_close" if was_fully_closed else "manual_partial_sale",
                         price=price, margin=margin_released, leveraged_value=quantity_sold * price,
                         quantity=quantity_sold, realized_pnl=realized_pnl, position_closed=was_fully_closed,
+                        leverage=cycle_leverage,
                     )
                     if self.position.is_open:
                         self.partial_reductions += 1
@@ -398,6 +433,7 @@ class PaperBot(threading.Thread):
                     else:
                         self.closed_cycles += 1
                         self.wins += int(realized_pnl > 0)
+                        self._finish_cycle()
                         self._record_action(
                             f"Manual paper sale closed the position at ${price:,.4f}; "
                             f"realized P&L ${realized_pnl:,.2f}."
@@ -442,14 +478,16 @@ class PaperBot(threading.Thread):
         lost_margin = self.position.margin_used
         quantity = self.position.quantity
         notional = self.position.notional
+        cycle_leverage = self.active_leverage
         self.position.__init__()
         self._record_trade(
             "liquidation", source="risk_monitor", reason="liquidation_price_reached",
             price=liquidation_price_value, margin=lost_margin, leveraged_value=notional,
-            quantity=quantity, realized_pnl=-lost_margin, position_closed=True,
+            quantity=quantity, realized_pnl=-lost_margin, position_closed=True, leverage=cycle_leverage,
         )
         self.closed_cycles += 1
         self.liquidations += 1
+        self._finish_cycle()
         self._record_action(f"Paper liquidation at ${liquidation_price_value:,.4f}; margin lost: ${lost_margin:,.2f}.")
 
     def _take_profit_target(self, mark_price: float) -> tuple[float, bool, float]:
@@ -459,14 +497,14 @@ class PaperBot(threading.Thread):
         target_margin_pct = self.definition.params.take_profit_margin_pct
         if use_reduced_target:
             target_margin_pct *= REDUCED_TARGET_MULTIPLIER
-        target_price = self.position.average_entry * (1.0 + target_margin_pct / (100.0 * LEVERAGE))
+        target_price = self.position.average_entry * (1.0 + target_margin_pct / (100.0 * self.active_leverage))
         return target_price, use_reduced_target, margin_pct
 
     def _process_price(self, price: float, rolling_high: float) -> None:
         params = self.definition.params
         if self.trading_enabled and not self.position.is_open:
             initial_trigger = rolling_high * (1.0 - params.initial_drop_pct / 100.0)
-            self.cycle_start_equity = self.cash
+            self._start_cycle()
             first_margin = self.cycle_start_equity * params.first_buy_fraction
             if price <= initial_trigger and self.cash >= first_margin:
                 self._buy(first_margin, price, f"Initial paper buy at ${price:,.4f}.")
@@ -498,16 +536,18 @@ class PaperBot(threading.Thread):
             if price >= target_price:
                 quantity_closed = self.position.quantity
                 closed_margin = self.position.margin_used
+                cycle_leverage = self.active_leverage
                 realized_pnl = quantity_closed * (price - self.position.average_entry)
                 self.cash, was_win = close_position(self.cash, self.position, price)
                 self._record_trade(
                     "position_closed", source="strategy", reason="take_profit",
                     price=price, margin=closed_margin, leveraged_value=quantity_closed * price,
-                    quantity=quantity_closed, realized_pnl=realized_pnl, position_closed=True,
+                    quantity=quantity_closed, realized_pnl=realized_pnl, position_closed=True, leverage=cycle_leverage,
                 )
                 self.closed_cycles += 1
                 self.wins += int(was_win)
                 self.reduced_target_exits += int(used_reduced_target)
+                self._finish_cycle()
                 target_label = "reduced " if used_reduced_target else ""
                 self._record_action(
                     f"{target_label.title()}take-profit paper sell of {quantity_closed:.4f} HYPE at ${price:,.4f} "
@@ -557,8 +597,11 @@ class PaperBot(threading.Thread):
                 },
                 "first_buy_label": "Current cycle first buy" if self.position.is_open else "Next first buy estimate",
                 "first_buy_margin": first_buy_margin,
-                "first_buy_position_value": first_buy_margin * LEVERAGE,
+                "first_buy_position_value": first_buy_margin * self.active_leverage,
                 "first_buy_basis": first_buy_basis,
+                "leverage": self.active_leverage,
+                "next_cycle_leverage": self.next_cycle_leverage,
+                "dip_lookback_hours": self.dip_lookback_hours,
                 "bot_id": self._state_slug(self.definition.name),
                 "position_open": self.position.is_open,
                 "trading_enabled": self.trading_enabled,
@@ -598,9 +641,11 @@ class PaperBot(threading.Thread):
 
 
 class DashboardState:
-    def __init__(self, bots: list[PaperBot], started_at: float) -> None:
+    def __init__(self, bots: list[PaperBot], started_at: float, next_cycle_leverage: float, dip_lookback_hours: int) -> None:
         self.bots = bots
         self.started_at = started_at
+        self.next_cycle_leverage = next_cycle_leverage
+        self.dip_lookback_hours = dip_lookback_hours
 
     def snapshot(self) -> dict[str, Any]:
         bot_snapshots = [bot.snapshot() for bot in self.bots]
@@ -608,7 +653,8 @@ class DashboardState:
         total_profit = total_portfolio_equity - TOTAL_STARTING_CASH
         return {
             "started_at": self.started_at,
-            "leverage": LEVERAGE,
+            "next_cycle_leverage": self.next_cycle_leverage,
+            "dip_lookback_hours": self.dip_lookback_hours,
             "starting_cash": TOTAL_STARTING_CASH,
             "per_bot_starting_cash": BOT_STARTING_CASH,
             "total_portfolio_equity": total_portfolio_equity,
@@ -709,7 +755,7 @@ DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
   <header>
-    <div><h1>HYPE Paper Bot Monitor</h1><div class="subtitle">Five independent 5x paper simulations. Manual actions use the current public price; pausing disables strategy trades while liquidation monitoring continues. No exchange orders are submitted.</div></div>
+    <div><h1>HYPE Paper Bot Monitor</h1><div class="subtitle">Five independent paper simulations. Manual actions use the current public price; pausing disables strategy trades while liquidation monitoring continues. No exchange orders are submitted.</div></div>
     <div class="updated" id="updated">Connecting to market data...</div>
   </header>
   <main>
@@ -823,8 +869,8 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('market').innerHTML = [
         ['Total portfolio', money(data.total_portfolio_equity), 'neutral'],
         ['Total P&L', signed(data.total_profit) + ` (${data.total_profit_pct >= 0 ? '+' : ''}${data.total_profit_pct.toFixed(2)}%)`, color(data.total_profit)],
-        ['HYPE mid', price(first.price), 'neutral'], ['96h rolling high', price(first.rolling_high), 'neutral'],
-        ['Leverage', data.leverage.toFixed(1) + 'x', 'neutral'], ['Mode', 'Paper trading', 'neutral']
+        ['HYPE mid', price(first.price), 'neutral'], [`${data.dip_lookback_hours}h rolling high`, price(first.rolling_high), 'neutral'],
+        ['Next-cycle leverage', data.next_cycle_leverage.toFixed(1) + 'x', 'neutral'], ['Mode', 'Paper trading', 'neutral']
       ].map(([label, value, valueClass]) => `<div class="market-item"><div class="label">${label}</div><div class="value ${valueClass}">${value}</div></div>`).join('');
       renderPriceChart(first);
       document.getElementById('bots').innerHTML = data.bots.map(bot => {
@@ -849,7 +895,7 @@ DASHBOARD_HTML = """<!doctype html>
           <div class="bot-header"><div class="bot-name">${bot.name}</div><div class="badge ${paused ? 'paused' : (isOpen ? 'open' : '')}">${bot.status}</div></div>
           <div class="first-buy-stat">
             <div class="first-buy-copy"><div class="first-buy-label">${bot.first_buy_label}</div><div class="first-buy-basis">${(bot.parameters.first_buy_pct).toFixed(1)}% of ${money(bot.first_buy_basis)}</div></div>
-            <div class="first-buy-values"><div class="first-buy-margin">${money(bot.first_buy_margin)} margin</div><div class="first-buy-notional">${money(bot.first_buy_position_value)} position value at 5×</div></div>
+            <div class="first-buy-values"><div class="first-buy-margin">${money(bot.first_buy_margin)} margin</div><div class="first-buy-notional">${money(bot.first_buy_position_value)} position value at ${bot.leverage.toFixed(1)}×</div></div>
           </div>
           <div class="params">
             <div class="param">Initial dip<b>${p.initial_drop_pct}%</b></div><div class="param">Recurring dip<b>${p.recurring_drop_pct}%</b></div>
@@ -860,7 +906,7 @@ DASHBOARD_HTML = """<!doctype html>
             <div class="metric"><div class="label">Total P&amp;L</div><div class="value ${color(bot.profit)}">${signed(bot.profit)}<br><small>${bot.profit_pct >= 0 ? '+' : ''}${bot.profit_pct.toFixed(2)}%</small></div></div>
             <div class="metric"><div class="label">Current position P&amp;L</div><div class="value ${color(bot.position_profit || 0)}">${bot.position_profit == null ? '—' : signed(bot.position_profit)}<br><small>${bot.position_profit_pct == null ? '—' : `${bot.position_profit_pct >= 0 ? '+' : ''}${bot.position_profit_pct.toFixed(2)}% of margin`}</small></div></div>
             <div class="metric"><div class="label">Margin used</div><div class="value">${money(bot.margin_used)}</div></div>
-            <div class="metric"><div class="label">5x position</div><div class="value">${money(bot.notional)}</div></div>
+            <div class="metric"><div class="label">${bot.leverage.toFixed(1)}x position</div><div class="value">${money(bot.notional)}</div></div>
           </div>
           <div class="levels">
             ${level('Available cash', money(bot.cash))}
@@ -886,7 +932,7 @@ DASHBOARD_HTML = """<!doctype html>
               <button onclick="controlBot(event, '${bot.bot_id}', document.getElementById('${actionId}').value, '${amountId}')">Submit</button>
             </div>
             <div class="control-unit" id="${bot.bot_id}-amount-unit">All amounts in USD</div>
-            <div class="control-help">Buy and sell use USD position value. Buys use 5× leverage; add margin is USD collateral.</div>
+            <div class="control-help">Buy and sell use USD position value. New buys use the cycle's displayed leverage; add margin is USD collateral.</div>
             <div class="control-message" id="message-${bot.bot_id}">${escapeHtml(controlMessages[bot.bot_id] || '')}</div>
           </div>
           <details class="history" data-history-id="${historyId}">
@@ -984,6 +1030,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Dashboard host. Defaults to local-only access.")
     parser.add_argument("--port", type=int, default=8765, help="Dashboard port. Defaults to 8765.")
     parser.add_argument("--poll-seconds", type=float, default=60.0, help="Public market-data polling interval. Defaults to 1 minute.")
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=DEFAULT_BOT_LEVERAGE,
+        help=f"Leverage for future position cycles. Defaults to {DEFAULT_BOT_LEVERAGE:g}x.",
+    )
+    parser.add_argument(
+        "--dip-lookback-hours",
+        "--lookback-hours",
+        dest="dip_lookback_hours",
+        type=int,
+        default=LOOKBACK_HOURS,
+        help=f"Completed 1-hour candles used for future initial-dip triggers. Defaults to {LOOKBACK_HOURS}.",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Start the dashboard without opening a browser tab.")
     return parser.parse_args()
 
@@ -992,15 +1052,26 @@ def main() -> None:
     args = parse_args()
     if args.poll_seconds <= 0:
         raise ValueError("--poll-seconds must be greater than zero.")
+    if not 1 < args.leverage <= HYPE_MAX_LEVERAGE:
+        raise ValueError(f"--leverage must be greater than 1 and no more than HYPE's {HYPE_MAX_LEVERAGE:g}x limit.")
+    if args.dip_lookback_hours < 1:
+        raise ValueError("--dip-lookback-hours must be at least 1.")
 
     stop_event = threading.Event()
-    market_data = MarketDataCache(refresh_seconds=args.poll_seconds)
-    bots = [PaperBot(definition, market_data, args.poll_seconds, stop_event) for definition in BOT_DEFINITIONS]
+    market_data = MarketDataCache(args.poll_seconds, args.dip_lookback_hours)
+    bots = [
+        PaperBot(definition, market_data, args.poll_seconds, stop_event, args.leverage, args.dip_lookback_hours)
+        for definition in BOT_DEFINITIONS
+    ]
     url = f"http://{args.host}:{args.port}"
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(DashboardState(bots, time.time())))
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        build_handler(DashboardState(bots, time.time(), args.leverage, args.dip_lookback_hours)),
+    )
     for bot in bots:
         bot.start()
     print(f"Started {len(bots)} HYPE paper-trading worker threads.")
+    print(f"Future cycles: {args.leverage:g}x leverage, {args.dip_lookback_hours}h initial-dip lookback.")
     print(f"Dashboard: {url}")
     print("Paper trading only: no orders, account credentials, or wallet access are used.")
     if not args.no_browser:

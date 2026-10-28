@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         description="Optimize the HYPE scalping strategy across multiple CPU processes."
     )
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH)
-    parser.add_argument("--leverages", default="5,6", help="Leverage values to test (default: 5,6).")
+    parser.add_argument("--leverages", default="5,6,7", help="Leverage values to test (default: 5,6,7).")
     parser.add_argument("--leverage", type=float, help="Test one leverage value instead of the --leverages grid.")
     parser.add_argument(
         "--max-cycle-margin-pct",
